@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dispatch — SMS Mail Merge Console</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<div class="app-shell">
+
+  <div class="app-header">
+    <div class="brand">
+      <div class="mark">Dispatch<span>.</span></div>
+      <div class="tagline">SMS mail-merge console</div>
+    </div>
+    <div class="conn-status" id="connStatus">
+      <span class="conn-dot" id="connDot"></span>
+      <span id="connText">Gateway not checked</span>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="settings">Settings</button>
+    <button class="tab-btn" data-tab="compose">Compose</button>
+    <button class="tab-btn" data-tab="dispatch">Review &amp; Dispatch</button>
+    <button class="tab-btn" data-tab="history">History</button>
+    <button class="tab-btn" data-tab="modem">Modem</button>
+  </div>
+
+  <!-- ============================================================ SETTINGS -->
+  <section class="tab-panel active" id="tab-settings">
+    <div class="two-col">
+      <div>
+        <div class="card">
+          <h2>SMS Gateway connection</h2>
+          <p class="card-sub">Address of the phone running the SMS Gateway app's Local Server (LAN IP or Tailscale hostname/IP).</p>
+          <div class="grid-2">
+            <div class="field">
+              <label>Address</label>
+              <input type="text" id="s_address" placeholder="192.168.1.42 or my-phone.tailnet.ts.net">
+            </div>
+            <div class="field">
+              <label>Port</label>
+              <input type="number" id="s_port" placeholder="8080">
+            </div>
+            <div class="field">
+              <label>Username</label>
+              <input type="text" id="s_username" placeholder="sms">
+            </div>
+            <div class="field">
+              <label>Password</label>
+              <input type="password" id="s_password" placeholder="(unchanged)">
+            </div>
+            <div class="field">
+              <label>Default country code</label>
+              <input type="text" id="s_cc" placeholder="e.g. 254">
+              <span class="hint">Used to expand local-format numbers like 07... that don't start with +</span>
+            </div>
+            <div class="field">
+              <label>SIM slot (optional)</label>
+              <input type="number" id="s_sim" placeholder="leave blank for default">
+            </div>
+          </div>
+          <div class="checkbox-row" style="margin-bottom:14px;">
+            <input type="checkbox" id="s_https">
+            <label for="s_https">Use HTTPS</label>
+          </div>
+          <div class="checkbox-row" style="margin-bottom:14px;">
+            <input type="checkbox" id="s_dlr" checked>
+            <label for="s_dlr">Request delivery reports</label>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btnSaveSettings">Save settings</button>
+            <button class="btn" id="btnTestConn">Test connection</button>
+          </div>
+          <div class="status-msg" id="settingsMsg"></div>
+        </div>
+
+        <div class="card">
+          <h2>Sending behaviour</h2>
+          <p class="card-sub">Throttle sending to avoid the carrier or gateway flagging bulk messages.</p>
+          <div class="grid-3">
+            <div class="field">
+              <label>Delay between messages (s)</label>
+              <input type="number" step="0.5" id="s_delay">
+            </div>
+            <div class="field">
+              <label>Batch size</label>
+              <input type="number" id="s_batch">
+              <span class="hint">Pause after this many sends</span>
+            </div>
+            <div class="field">
+              <label>Batch pause (s)</label>
+              <input type="number" step="1" id="s_batchpause">
+            </div>
+          </div>
+          <button class="btn btn-primary" id="btnSaveThrottle">Save</button>
+        </div>
+
+        <div class="card">
+          <h2>Modem (Huawei MU509)</h2>
+          <p class="card-sub">Ports and dial settings used by the separate modem-manager daemon for internet (PPP) and, eventually, SMS. See the Modem tab for live status.</p>
+          <div class="grid-2">
+            <div class="field">
+              <label>AT control port</label>
+              <input type="text" id="m_control_port" placeholder="/dev/ttyUSB0">
+            </div>
+            <div class="field">
+              <label>PPP data port</label>
+              <input type="text" id="m_data_port" placeholder="/dev/ttyUSB1">
+            </div>
+            <div class="field">
+              <label>APN</label>
+              <input type="text" id="m_apn" placeholder="internet">
+            </div>
+            <div class="field">
+              <label>GPIO power pin (BCM)</label>
+              <input type="number" id="m_gpio_pin" placeholder="17">
+            </div>
+            <div class="field">
+              <label>PPP username (if required)</label>
+              <input type="text" id="m_ppp_user" placeholder="optional">
+            </div>
+            <div class="field">
+              <label>PPP password (if required)</label>
+              <input type="password" id="m_ppp_pass" placeholder="optional">
+            </div>
+            <div class="field">
+              <label>SIM PIN (if the SIM is locked)</label>
+              <input type="password" id="m_sim_pin" placeholder="optional">
+            </div>
+          </div>
+          <div class="checkbox-row" style="margin-bottom:14px;">
+            <input type="checkbox" id="m_auto_connect" checked>
+            <label for="m_auto_connect">Automatically maintain the internet connection</label>
+          </div>
+          <button class="btn btn-primary" id="btnSaveModemSettings">Save modem settings</button>
+          <div class="status-msg" id="modemSettingsMsg"></div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2>Send a test message</h2>
+          <p class="card-sub">Confirm everything works end-to-end before a bulk run.</p>
+          <div class="field">
+            <label>Phone number</label>
+            <input type="text" id="t_phone" placeholder="+2547...">
+          </div>
+          <div class="field">
+            <label>Message</label>
+            <textarea id="t_message" rows="3" placeholder="Test message from Dispatch"></textarea>
+          </div>
+          <button class="btn btn-primary" id="btnTestSend">Send test SMS</button>
+          <div class="status-msg" id="testMsg"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= COMPOSE -->
+  <section class="tab-panel" id="tab-compose">
+    <div class="two-col">
+      <div>
+        <div class="card">
+          <h2>1 · Message template</h2>
+          <p class="card-sub">Use <span class="mono">{field_name}</span> for anything that should be personalized, e.g. <span class="mono">{name}</span>, <span class="mono">{fee_balance}</span>.</p>
+          <textarea id="templateText" rows="6" placeholder="Dear {name}, your fee balance as of {due_date} is KES {fee_balance}. Kindly clear it at your earliest convenience."></textarea>
+          <div style="margin-top:12px;">
+            <div class="section-title">Detected fields</div>
+            <div class="chip-row" id="fieldsChips"><span class="chip muted">none yet</span></div>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="btnSaveTemplate">Save as reusable template</button>
+            <select id="templateLibrary" style="max-width:220px;">
+              <option value="">Load saved template…</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>2 · Recipient list (CSV)</h2>
+          <p class="card-sub">Upload a CSV with one row per recipient. A phone number column is required.
+            <a href="/api/sample-csv">Download a sample CSV</a>.
+          </p>
+          <input type="file" id="csvFile" accept=".csv">
+          <div id="csvInfo" style="margin-top:14px; display:none;">
+            <div class="field">
+              <label>Phone number column</label>
+              <select id="phoneColumnSelect"></select>
+            </div>
+            <div class="section-title" style="margin-top:14px;">Map template fields to CSV columns</div>
+            <div id="mappingRows"></div>
+            <div class="status-msg" id="csvValidationMsg"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>3 · Preview &amp; create campaign</h2>
+          <div class="field">
+            <label>Campaign name</label>
+            <input type="text" id="campaignName" placeholder="July fee reminders">
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btnGeneratePreview">Generate preview</button>
+          </div>
+          <div id="previewSummary" style="margin-top:14px;"></div>
+          <div class="btn-row" style="margin-top:10px;">
+            <button class="btn btn-primary" id="btnCreateCampaign" disabled>Create campaign →</button>
+            <button class="btn" id="btnResetCompose">Reset form</button>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2>Live preview</h2>
+          <p class="card-sub">First matching row, rendered as it will arrive on the phone.</p>
+          <div class="phone-mock">
+            <div class="bubble" id="previewBubble">Fill in a template and upload a CSV to see a preview here.</div>
+            <div class="meta">
+              <span id="previewChars">0 chars</span>
+              <span id="previewSegments">0 segments</span>
+            </div>
+          </div>
+        </div>
+        <div class="card" id="previewTableCard" style="display:none;">
+          <h2>All rows</h2>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>#</th><th>Phone</th><th>Message</th><th>Status</th></tr></thead>
+              <tbody id="previewTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ DISPATCH -->
+  <section class="tab-panel" id="tab-dispatch">
+    <div class="card" id="noCampaignCard">
+      <div class="empty-state">No campaign selected yet. Create one from the Compose tab, or open one from History.</div>
+    </div>
+
+    <div id="campaignView" style="display:none;">
+      <div class="card">
+        <h2 id="dCampaignName">—</h2>
+        <p class="card-sub" id="dCampaignMeta"></p>
+
+        <div class="summary-row" id="dSummary"></div>
+        <div class="progress-bar" id="dProgress"></div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btnStart">Start dispatch</button>
+          <button class="btn" id="btnPause">Pause</button>
+          <button class="btn" id="btnResume">Resume</button>
+          <button class="btn btn-danger" id="btnStop">Stop</button>
+          <button class="btn" id="btnRefreshStatus">Refresh delivery status</button>
+          <button class="btn" id="btnExport">Export results CSV</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Recipients</h2>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>#</th><th>Phone</th><th>Message</th><th>Status</th></tr></thead>
+            <tbody id="dispatchTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================= HISTORY -->
+  <section class="tab-panel" id="tab-history">
+    <div class="card">
+      <h2>Past campaigns</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Name</th><th>Created</th><th>Total</th><th>Sent</th><th>Failed</th><th>Status</th><th></th></tr></thead>
+          <tbody id="historyTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- =============================================================== MODEM -->
+  <section class="tab-panel" id="tab-modem">
+    <div class="card">
+      <h2>Modem status</h2>
+      <p class="card-sub">Reported by the modem-manager daemon (a separate process from this dashboard) via the shared database. If the daemon isn't running yet, this will stay blank.</p>
+      <div class="summary-row" id="modemSummary"></div>
+      <div class="grid-2" id="modemDetails" style="margin-top:6px;"></div>
+      <div class="btn-row" style="margin-top:14px;">
+        <button class="btn" id="btnModemPowerCycle">Power-cycle modem</button>
+        <button class="btn" id="btnModemReconnect">Reconnect internet now</button>
+      </div>
+      <div class="status-msg" id="modemActionMsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>USSD</h2>
+      <p class="card-sub">Dial a code (e.g. balance check, bundle purchase). If the network expects a reply, this box turns into a reply field until the session ends.</p>
+      <div class="field">
+        <label id="ussdInputLabel">USSD code</label>
+        <input type="text" id="ussdInput" placeholder="*144#">
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="btnUssdSend">Send</button>
+        <button class="btn btn-danger" id="btnUssdEnd" style="display:none;">End session</button>
+      </div>
+      <div id="ussdResponseBox" style="display:none; margin-top:12px; background:var(--panel-alt); border:1px solid var(--border); border-radius:8px; padding:12px;">
+        <div class="section-title" style="margin-bottom:6px;">Network reply</div>
+        <div id="ussdResponseText" style="white-space:pre-wrap; font-size:13.5px;"></div>
+      </div>
+      <div class="status-msg" id="ussdMsg"></div>
+    </div>
+
+    <div class="card">
+      <h2>Inbox</h2>
+      <p class="card-sub">Messages are copied off the SIM and deleted from SIM storage as soon as they're seen — this list is the durable copy.</p>
+      <div class="field" id="quickReplyBox" style="display:none; background:var(--panel-alt); padding:12px; border-radius:8px; border:1px solid var(--border);">
+        <label>Replying to <span id="replyToPhone" class="mono"></span></label>
+        <textarea id="replyText" rows="3" placeholder="Type a reply…"></textarea>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn btn-primary" id="btnSendReply">Send</button>
+          <button class="btn" id="btnCancelReply">Cancel</button>
+        </div>
+      </div>
+      <div class="status-msg" id="inboxActionMsg"></div>
+      <div class="table-scroll" style="max-height:360px; margin-top:10px;">
+        <table>
+          <thead><tr><th style="width:130px;">From</th><th style="width:150px;">Time</th><th>Message</th><th style="width:150px;"></th></tr></thead>
+          <tbody id="inboxTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live log</h2>
+      <p class="card-sub">Unsolicited events, power/PPP retries, and daemon activity, newest at the bottom.</p>
+      <div class="table-scroll" id="modemLogScroll" style="max-height:320px;">
+        <table>
+          <thead><tr><th style="width:150px;">Time</th><th style="width:90px;">Category</th><th>Message</th></tr></thead>
+          <tbody id="modemLogBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+
+</div>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

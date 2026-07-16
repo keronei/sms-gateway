@@ -1,0 +1,6 @@
+# Install only on the Raspberry Pi (pip install -r requirements-modem.txt),
+# not on the Mac dev machine - RPi.GPIO won't build there and isn't needed
+# there anyway, since the modem daemon only ever runs on the Pi.
+pyserial>=3.5
+gpiozero>=2.0
+RPi.GPIO>=0.7.1
