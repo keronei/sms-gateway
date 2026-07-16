@@ -8,8 +8,8 @@ StartLimitIntervalSec=0
 # serial ports (dialout), pppd (dip), and GPIO (gpio). See README "Modem
 # daemon setup" for the exact `usermod` commands.
 User=root
-WorkingDirectory=/root/sms-dashboard
-ExecStart=/root/sms-dashboard/venv/bin/python3 /root/sms-dashboard/run_modem_manager.py
+WorkingDirectory=/root/sms-gateway
+ExecStart=/root/sms-gateway/venv/bin/python3 /root/sms-gateway/run_modem_manager.py
 Restart=always
 RestartSec=5
 
