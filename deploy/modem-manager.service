@@ -9,7 +9,7 @@ StartLimitIntervalSec=0
 # daemon setup" for the exact `usermod` commands.
 User=root
 WorkingDirectory=/root/sms-gateway
-ExecStart=/root/sms-gateway/venv/bin/python3 /root/sms-gateway/run_modem_manager.py
+ExecStart=/root/sms-gateway/env/bin/python3 /root/sms-gateway/run_modem_manager.py
 Restart=always
 RestartSec=5
 
