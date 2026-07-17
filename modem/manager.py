@@ -38,6 +38,7 @@ class ModemManager:
         self._last_network_refresh = 0
         self._inbox_dirty = threading.Event()
         self._ussd_waiter = ussd.UssdWaiter()
+        self._ppp_config_snapshot = None
 
     # ------------------------------------------------------------- utils
     def reload_settings(self):
@@ -143,30 +144,15 @@ class ModemManager:
         ch.send("ATE0")           # echo off - cleaner parsing on our side
         ch.send("AT+CMEE=2")      # verbose +CME/+CMS error strings instead of bare numbers
 
-        sim_status = "unknown"
         try:
-            resp = ch.send("AT+CPIN?")
-            text = resp.text
-            if "READY" in text:
-                sim_status = "ready"
-            elif "SIM PIN" in text:
-                sim_status = "pin_required"
-                pin = self.settings.get("modem_sim_pin")
-                if pin:
-                    try:
-                        ch.send(f'AT+CPIN="{pin}"')
-                        sim_status = "ready"
-                        self.log("info", "sim", "SIM PIN accepted")
-                    except ATError as e:
-                        sim_status = "pin_error"
-                        self.log("error", "sim", f"SIM PIN rejected: {e}")
-                else:
-                    self.log("warn", "sim", "SIM requires a PIN but none is configured in Settings")
-            else:
-                sim_status = "error"
-        except ATError as e:
-            sim_status = "absent"
-            self.log("error", "sim", f"AT+CPIN? failed: {e}")
+            ch.send('AT+CSCS="IRA"')
+            self.log("info", "at", "Character set set to IRA (plain ASCII pass-through)")
+        except (ATError, ATTimeout) as e:
+            # Not fatal, but SMS/USSD text will likely come back hex-encoded
+            # instead of readable without this - see text_codec.py's fallback.
+            self.log("warn", "at", f"AT+CSCS=\"IRA\" failed (continuing anyway): {e}")
+
+        sim_status = self._check_and_unlock_sim(ch)
 
         db.update_modem_status(at_ready=True, sim_status=sim_status)
         self.log("info", "at", f"Control channel ready on {ch.port}; SIM status: {sim_status}")
@@ -186,18 +172,55 @@ class ModemManager:
         self._refresh_network_info()
         self._inbox_dirty.set()  # sweep for anything already sitting on the SIM
 
+    def _check_and_unlock_sim(self, ch):
+        """Checks AT+CPIN? and, if the SIM is locked, attempts to unlock it
+        with whatever PIN is currently configured. Shared by init and by the
+        periodic retry in _apply_live_settings_changes(), so entering a PIN
+        in Settings after the SIM already came up locked actually gets
+        applied without needing a full daemon/channel restart."""
+        try:
+            resp = ch.send("AT+CPIN?")
+            text = resp.text
+        except ATError as e:
+            self.log("error", "sim", f"AT+CPIN? failed: {e}")
+            return "absent"
+
+        if "READY" in text:
+            return "ready"
+        if "SIM PIN" not in text:
+            return "error"
+
+        pin = self.settings.get("modem_sim_pin")
+        if not pin:
+            self.log("warn", "sim", "SIM requires a PIN but none is configured in Settings")
+            return "pin_required"
+        try:
+            ch.send(f'AT+CPIN="{pin}"')
+            self.log("info", "sim", "SIM PIN accepted")
+            return "ready"
+        except ATError as e:
+            self.log("error", "sim", f"SIM PIN rejected: {e}")
+            return "pin_error"
+
     # -------------------------------------------------------------- ppp
+    def _ppp_config(self):
+        return (
+            self.settings.get("modem_data_port") or "/dev/ttyUSB1",
+            int(self.settings.get("modem_baud") or 115200),
+            self.settings.get("modem_apn") or "",
+            self.settings.get("modem_ppp_username") or "",
+            self.settings.get("modem_ppp_password") or "",
+        )
+
     def _ensure_ppp_supervisor(self):
         if self.ppp and self.ppp.is_alive():
             return
+        data_port, baud, apn, username, password = self._ppp_config()
         self.ppp = PPPSupervisor(
-            data_port=self.settings.get("modem_data_port") or "/dev/ttyUSB1",
-            baud=int(self.settings.get("modem_baud") or 115200),
-            apn=self.settings.get("modem_apn") or "",
-            username=self.settings.get("modem_ppp_username") or "",
-            password=self.settings.get("modem_ppp_password") or "",
+            data_port=data_port, baud=baud, apn=apn, username=username, password=password,
             auto_connect=lambda: bool(self.reload_settings_get("modem_auto_connect", 1)),
         )
+        self._ppp_config_snapshot = (data_port, baud, apn, username, password)
         self.ppp.start()
 
     def reload_settings_get(self, key, default=None):
@@ -216,8 +239,37 @@ class ModemManager:
                 db.update_modem_status(at_ready=False, device_present=False)
                 self._teardown_control_channel()
                 return
+            self.reload_settings()
+            if self._apply_live_settings_changes():
+                return  # control port changed - let the outer loop reopen it
             if time.time() - self._last_network_refresh > NETWORK_INFO_INTERVAL:
                 self._refresh_network_info()
+
+    def _apply_live_settings_changes(self):
+        """Picks up Settings edits made while this component is already
+        running, without requiring a full daemon restart. Returns True if
+        the control channel was torn down (caller must stop using it and
+        let the outer loop in run() reopen it on the new port)."""
+        control_port = self.settings.get("modem_control_port") or "/dev/ttyUSB0"
+        if self.control_channel and control_port != self.control_channel.port:
+            self.log("info", "system",
+                     f"Control port changed in Settings ({self.control_channel.port} -> {control_port}); reopening")
+            self._teardown_control_channel()
+            return True
+
+        if self.ppp and self._ppp_config() != self._ppp_config_snapshot:
+            self.log("info", "ppp", "PPP settings changed; restarting PPP supervisor with the new config")
+            self.ppp.stop()
+            self.ppp = None
+            self._ensure_ppp_supervisor()
+
+        status = db.get_modem_status()
+        if status.get("sim_status") in ("pin_required", "pin_error") and self.settings.get("modem_sim_pin"):
+            new_status = self._check_and_unlock_sim(self.control_channel)
+            if new_status != status.get("sim_status"):
+                db.update_modem_status(sim_status=new_status)
+
+        return False
 
     def _refresh_network_info(self):
         ch = self.control_channel
@@ -339,11 +391,17 @@ class ModemManager:
                 db.complete_modem_command(cmd["id"], "done", "Power pulse sent")
             elif name == "reconnect_ppp":
                 self.log("info", "ppp", "Manual reconnect requested from dashboard")
-                if self.ppp:
+                self.reload_settings()
+                if self.ppp and self._ppp_config() != self._ppp_config_snapshot:
+                    self.log("info", "ppp", "PPP settings changed; rebuilding supervisor before reconnecting")
+                    self.ppp.stop()
+                    self.ppp = None
+                    self._ensure_ppp_supervisor()
+                elif self.ppp:
                     self.ppp.request_reconnect()
-                    db.complete_modem_command(cmd["id"], "done", "Reconnect triggered")
                 else:
-                    db.complete_modem_command(cmd["id"], "failed", "PPP supervisor not running yet")
+                    self._ensure_ppp_supervisor()
+                db.complete_modem_command(cmd["id"], "done", "Reconnect triggered")
             elif name == "send_sms":
                 self._handle_send_sms(cmd)
             elif name == "send_ussd":

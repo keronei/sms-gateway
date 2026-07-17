@@ -12,12 +12,16 @@ Knows nothing about the database - manager.py is responsible for persisting
 what these functions return.
 """
 import re
+import csv
+import io
 import time
+import calendar
 
 from modem.serial_at import ATError, ATTimeout
+from modem import text_codec
 
-CMGL_HEADER_RE = re.compile(r'^\+CMGL:\s*(\d+),"([^"]*)","([^"]*)",,"([^"]*)"$')
 CMGS_REF_RE = re.compile(r'^\+CMGS:\s*(\d+)$')
+TIMESTAMP_RE = re.compile(r"^\d{2}/\d{2}/\d{2},\d{2}:\d{2}:\d{2}[+-]\d{1,2}$")
 
 
 def configure(channel, timeout=10):
@@ -51,10 +55,58 @@ def send_text(channel, phone, text, prompt_timeout=10, send_timeout=30):
 
 
 # ------------------------------------------------------------------ parsing
+def _parse_cmgl_header(line):
+    """+CMGL: <index>,<stat>,<oa>,[<alpha>],<scts>  - <alpha> is normally
+    omitted (giving the "...,," most examples show) but some carriers
+    populate it with a sender name alongside a shortcode/number, which the
+    previous rigid regex here didn't account for and would silently mis-
+    parse. Using csv.reader to split fields properly handles both: it
+    respects quoting (so the timestamp's internal comma doesn't split it
+    into two fields) and naturally gives an empty string for omitted
+    fields (",,") without needing a fixed field count."""
+    if not line.startswith("+CMGL:"):
+        return None
+    rest = line[len("+CMGL:"):].strip()
+    try:
+        row = next(csv.reader(io.StringIO(rest), skipinitialspace=True))
+    except (csv.Error, StopIteration):
+        return None
+    if len(row) < 3:
+        return None
+    try:
+        sim_index = int(row[0].strip())
+    except ValueError:
+        return None
+
+    status = row[1].strip() if len(row) > 1 else ""
+    sender = row[2].strip() if len(row) > 2 else ""
+    alpha = row[3].strip() if len(row) > 3 else ""
+    raw_timestamp = ""
+    for candidate in row[4:] + ([alpha] if alpha else []):
+        if TIMESTAMP_RE.match(candidate.strip()):
+            raw_timestamp = candidate.strip()
+            break
+
+    # if the alpha tag is populated (a friendly sender name alongside a
+    # shortcode/number) and isn't just a duplicate of the sender field,
+    # fold it into a "Name <number>" style display
+    if alpha and alpha != sender and not TIMESTAMP_RE.match(alpha):
+        sender_display = f"{alpha} <{sender}>" if sender else alpha
+    else:
+        sender_display = sender
+
+    return {
+        "sim_index": sim_index,
+        "status": status,
+        "sender": text_codec.decode_possible_hex(sender_display),
+        "raw_timestamp": raw_timestamp,
+    }
+
+
 def _parse_cmgl(lines):
-    """+CMGL: <idx>,"<stat>","<sender>",,"<timestamp>"  followed by the body
-    line(s) until the next header. Message bodies could in principle contain
-    a line starting with '+CMGL:' themselves, which would confuse this - an
+    """Header lines (see _parse_cmgl_header) followed by the body line(s)
+    until the next header. Message bodies could in principle contain a line
+    starting with '+CMGL:' themselves, which would confuse this - an
     accepted, extremely unlikely edge case for a text-mode SMS inbox."""
     records = []
     current = None
@@ -63,21 +115,15 @@ def _parse_cmgl(lines):
     def _flush():
         if current is not None:
             body = "\n".join(body_lines).strip()
-            ts_raw = current["raw_timestamp"]
-            current["body"] = body
-            current["received_at"] = _parse_timestamp(ts_raw)
+            current["body"] = text_codec.decode_possible_hex(body)
+            current["received_at"] = _parse_timestamp(current["raw_timestamp"])
             records.append(current)
 
     for line in lines:
-        m = CMGL_HEADER_RE.match(line.strip())
-        if m:
+        header = _parse_cmgl_header(line.strip())
+        if header:
             _flush()
-            current = {
-                "sim_index": int(m.group(1)),
-                "status": m.group(2),
-                "sender": m.group(3),
-                "raw_timestamp": m.group(4),
-            }
+            current = header
             body_lines = []
         elif current is not None:
             body_lines.append(line)
@@ -91,7 +137,7 @@ def _parse_timestamp(raw):
     time.time() as the received_at) if parsing fails - the raw string is
     always preserved regardless."""
     try:
-        m = re.match(r"(\d{2})/(\d{2})/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d{1,2})", raw)
+        m = re.match(r"(\d{2})/(\d{2})/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d{1,2})", raw or "")
         if not m:
             return None
         yy, MM, dd, hh, mm, ss, tz_quarters = m.groups()
@@ -100,7 +146,6 @@ def _parse_timestamp(raw):
         dt = time.struct_time((year, int(MM), int(dd), int(hh), int(mm), int(ss), 0, 0, -1))
         # the fields are "local to the handset"; treat them as UTC first via
         # calendar.timegm, then shift by the reported offset to get true UTC.
-        import calendar
         epoch_as_if_utc = calendar.timegm(dt)
         return epoch_as_if_utc - tz_minutes * 60
     except (ValueError, TypeError):

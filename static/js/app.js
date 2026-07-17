@@ -501,9 +501,11 @@ function renderInbox(messages) {
       <td class="mono">${escapeHtml(m.sender || "—")}</td>
       <td class="mono" style="color:var(--muted);">${m.received_at ? new Date(m.received_at * 1000).toLocaleString() : "—"}</td>
       <td class="msg-cell">${escapeHtml(m.body)} ${m.status === "unread" ? '<span class="badge badge-queued" style="margin-left:6px;">New</span>' : ""}</td>
-      <td>
-        <button class="btn" onclick="replyToInbox(${m.id}, '${escapeHtml(m.sender || "").replace(/'/g, "\\'")}')">Reply</button>
-        <button class="btn btn-danger" onclick="deleteInboxMessage(${m.id})">Delete</button>
+      <td class="actions-cell">
+        <div class="row-actions">
+          <button class="btn" onclick="replyToInbox(${m.id}, '${escapeHtml(m.sender || "").replace(/'/g, "\\'")}')">Reply</button>
+          <button class="btn btn-danger" onclick="deleteInboxMessage(${m.id})">Delete</button>
+        </div>
       </td>
     </tr>`).join("");
 }
@@ -682,9 +684,11 @@ async function loadHistory() {
       <td style="color:var(--green)">${c.sent}</td>
       <td style="color:var(--red)">${c.failed}</td>
       <td>${badge(c.status === "dispatching" ? "sending" : c.status === "completed" ? "sent" : c.status)}</td>
-      <td>
-        <button class="btn" onclick="openCampaign(${c.id})">Open</button>
-        <button class="btn btn-danger" onclick="deleteCampaign(${c.id})">Delete</button>
+      <td class="actions-cell">
+        <div class="row-actions">
+          <button class="btn" onclick="openCampaign(${c.id})">Open</button>
+          <button class="btn btn-danger" onclick="deleteCampaign(${c.id})">Delete</button>
+        </div>
       </td>
     </tr>`).join("") || `<tr><td colspan="7"><div class="empty-state">No campaigns yet.</div></td></tr>`;
 }

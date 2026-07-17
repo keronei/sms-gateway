@@ -268,7 +268,9 @@ td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: 
 tr:last-child td { border-bottom: none; }
 .table-scroll { max-height: 420px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
 .mono { font-family: var(--font-mono); font-size: 12.5px; }
-.msg-cell { max-width: 340px; }
+.msg-cell { max-width: 340px; word-break: break-word; overflow-wrap: anywhere; }
+.actions-cell { width: 160px; white-space: nowrap; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .err-text { color: var(--red); font-size: 11.5px; }
 
 /* --------------------------------------------------------------- badges */

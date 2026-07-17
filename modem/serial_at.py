@@ -121,7 +121,7 @@ class ATChannel:
             return
         while b"\r\n" in self._buf:
             line, self._buf = self._buf.split(b"\r\n", 1)
-            text = line.decode(errors="replace").strip()
+            text = line.decode("latin-1").strip()
             if text:
                 self._handle_line(text)
 

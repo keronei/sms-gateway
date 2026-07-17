@@ -20,6 +20,8 @@ network, 4 = operation not supported, 5 = network timeout.
 import re
 import threading
 
+from modem import text_codec
+
 CUSD_RE = re.compile(r'^\+CUSD:\s*(\d)(?:\s*,\s*"((?:[^"\\]|\\.)*)"(?:\s*,\s*(\d+))?)?\s*$')
 
 
@@ -69,35 +71,9 @@ def _escape(text):
 
 # ------------------------------------------------------------------ decode
 def decode_ussd_text(dcs, text):
-    """Best-effort decode of a +CUSD response string. dcs=15 (and 0) are
-    plain text and returned as-is. UCS2 (commonly dcs=72, sometimes other
-    values depending on chipset/network quirks) is a hex string, 4 hex
-    digits per UTF-16 code unit. Different networks/modems are known to be
-    inconsistent about the exact dcs value here, so as a safety net we also
-    try to detect "this really looks like UCS2 hex" even when dcs doesn't
-    match the expected value, rather than showing raw hex to the user."""
-    if dcs in (0, 15):
-        return text
-    if _looks_like_ucs2_hex(text):
-        decoded = _try_decode_ucs2(text)
-        if decoded is not None:
-            return decoded
-    return text
-
-
-def _looks_like_ucs2_hex(text):
-    return bool(text) and len(text) % 4 == 0 and all(c in "0123456789abcdefABCDEF" for c in text)
-
-
-def _try_decode_ucs2(text):
-    try:
-        raw = bytes.fromhex(text)
-        decoded = raw.decode("utf-16-be")
-        # sanity check: reject if it decoded to mostly control/non-printable
-        # junk, which suggests this wasn't actually UCS2 after all
-        printable = sum(1 for ch in decoded if ch.isprintable())
-        if decoded and printable / len(decoded) > 0.8:
-            return decoded
-        return None
-    except (ValueError, UnicodeDecodeError):
-        return None
+    """dcs=15 (and 0) are meant to be plain text per the module's own docs,
+    but real devices/carriers are inconsistent about honoring that - so even
+    for dcs=15 we run the same "does this actually look like hex that needs
+    decoding" check used for SMS bodies, rather than trusting the flag
+    blindly. See text_codec.py for the ASCII-hex/UCS2 detection logic."""
+    return text_codec.decode_possible_hex(text)

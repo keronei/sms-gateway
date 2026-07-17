@@ -30,6 +30,26 @@ CHAT_BIN = "/usr/sbin/chat"
 PPP_UNIT = 0
 PPP_IFACE = f"ppp{PPP_UNIT}"
 
+# From pppd(8)'s EXIT STATUS section - the common ones worth explaining inline
+# rather than leaving the user to look up a bare exit code.
+PPPD_EXIT_CODES = {
+    1: "fatal error",
+    2: "options error",
+    3: "not setuid-root / insufficient privilege",
+    4: "kernel does not support PPP",
+    5: "terminated by signal",
+    6: "serial port could not be locked",
+    7: "serial port could not be opened",
+    8: "the connect (chat) script failed - check the AT dial exchange just "
+       "above this in the log for the actual reason (e.g. NO CARRIER/ERROR "
+       "from the network, often means no active data bundle/APN rejected)",
+    10: "PPP negotiation failed - no network protocols could be started",
+    11: "peer refused to authenticate",
+    16: "the modem hung up",
+    17: "serial loopback detected",
+    19: "we failed to authenticate ourselves to the peer (check PPP username/password)",
+}
+
 
 class PPPSupervisor:
     def __init__(self, data_port, baud, apn, username="", password="", auto_connect=lambda: True):
@@ -142,7 +162,7 @@ class PPPSupervisor:
 
     def _dial_and_wait_for_ip(self):
         chat_path = self._write_chat_script()
-        connect_cmd = f"{CHAT_BIN} -v -f {shlex.quote(chat_path)}"
+        connect_cmd = f"{CHAT_BIN} -v -s -f {shlex.quote(chat_path)}"
 
         args = [
             PPPD_BIN, self.data_port, str(self.baud),
@@ -168,8 +188,10 @@ class PPPSupervisor:
         deadline = time.time() + CONNECT_TIMEOUT
         while time.time() < deadline:
             if self._proc.poll() is not None:
-                self._log("error", f"pppd exited early (code {self._proc.returncode})")
-                db.update_modem_status(ppp_last_error=f"pppd exited with code {self._proc.returncode}")
+                code = self._proc.returncode
+                hint = PPPD_EXIT_CODES.get(code, "see pppd(8) EXIT STATUS for what this code means")
+                self._log("error", f"pppd exited early (code {code}: {hint})")
+                db.update_modem_status(ppp_last_error=f"pppd exited with code {code} ({hint})")
                 return None
             ip = self._read_interface_ip(PPP_IFACE)
             if ip:

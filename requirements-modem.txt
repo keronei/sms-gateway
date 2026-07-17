@@ -1,6 +1,12 @@
 # Install only on the Raspberry Pi (pip install -r requirements-modem.txt),
-# not on the Mac dev machine - RPi.GPIO won't build there and isn't needed
-# there anyway, since the modem daemon only ever runs on the Pi.
+# not on the Mac dev machine - not needed there, since the modem daemon only
+# ever runs on the Pi.
+#
+# Using lgpio rather than RPi.GPIO as the GPIO backend: RPi.GPIO is a legacy
+# library that's increasingly awkward on Bookworm-era kernels (the GPIO
+# character-device interface changed) and often fails to build against
+# newer Python versions. gpiozero auto-detects and uses lgpio with no code
+# changes needed on our side.
 pyserial>=3.5
 gpiozero>=2.0
-RPi.GPIO>=0.7.1
+lgpio>=0.2.2
