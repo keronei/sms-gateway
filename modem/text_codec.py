@@ -1,26 +1,37 @@
 """
 text_codec.py - best-effort decoding of AT response text that might actually
-be hex-encoded bytes rather than already-readable text.
+be encoded bytes rather than already-readable text.
 
 Both SMS bodies (AT+CMGL/CMGR in text mode) and USSD replies (+CUSD:) can
-come back as a hex string instead of plain text - modems commonly fall back
-to this whenever the underlying message used an encoding (typically UCS2)
-that can't be represented in the currently-configured character set. There
-are two hex-encoding shapes to watch for:
+come back in one of several shapes instead of plain text, depending on
+firmware/carrier quirks:
 
-  - UCS2: 4 hex digits per UTF-16BE code unit (e.g. "0048" = 'H')
-  - raw 8-bit/ASCII bytes: 2 hex digits per byte (e.g. "48" = 'H')
+  - hex-encoded UCS2: 4 hex digits per UTF-16BE code unit (e.g. "0048" = 'H')
+  - hex-encoded raw 8-bit/ASCII bytes: 2 hex digits per byte
+  - raw packed 7-bit GSM septets (GSM 03.38), sent directly as bytes over
+    the wire rather than hex-represented at all - this shows up as
+    seemingly-random extended-Latin/control characters once the transport
+    layer correctly preserves the raw bytes (see serial_at.py's latin-1
+    decode) instead of mangling them
 
-We can't always know which one applies just from a dcs/status flag (and
+We can't always know which applies just from a dcs/status flag (and
 different firmware/carriers are inconsistent about it), so this module
-detects "does this look like hex" and tries both interpretations, keeping
-whichever produces mostly-printable text. Relies on the serial transport
-layer (serial_at.py) preserving raw byte values losslessly (decoding as
-latin-1, not UTF-8-with-replacement) - otherwise the bytes needed here would
-already be destroyed before reaching this code.
+detects each shape and tries the decode, keeping whichever produces
+mostly-printable text. Relies on the serial transport layer preserving raw
+byte values losslessly - otherwise the bytes needed here would already be
+destroyed before reaching this code.
 """
 
 PRINTABLE_RATIO_THRESHOLD = 0.8
+
+# GSM 03.38 default alphabet, indexed 0-127 by septet value.
+GSM7_DEFAULT_ALPHABET = (
+    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ"
+    " !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§"
+    "¿abcdefghijklmnopqrstuvwxyzäöñüà"
+)
+assert len(GSM7_DEFAULT_ALPHABET) == 128
 
 
 def looks_like_hex(text):
@@ -57,19 +68,68 @@ def try_decode_ascii_hex(text):
     return None
 
 
+def try_decode_packed_gsm7(text):
+    """Recovers the original bytes (via latin-1, which is lossless for
+    whatever serial_at.py handed us) and unpacks them as GSM 7-bit default-
+    alphabet septets. This is for firmware that sends already-packed septet
+    bytes directly, rather than hex-representing them - a different quirk
+    than the hex cases above, and the one that matches "extended-Latin/box
+    characters" rather than "looks like hex digits"."""
+    if not text:
+        return None
+    try:
+        raw = text.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+    septets = _unpack_septets(raw)
+    if not septets:
+        return None
+    # a lone trailing septet 0 is a common padding artifact (leftover zero
+    # bits when the septet count isn't a clean multiple of 8) rather than a
+    # real '@' character - drop it before mapping to characters
+    if len(septets) > 1 and septets[-1] == 0:
+        septets = septets[:-1]
+    chars = [GSM7_DEFAULT_ALPHABET[s] for s in septets if s < len(GSM7_DEFAULT_ALPHABET)]
+    decoded = "".join(chars)
+    return decoded if _mostly_ascii_printable(decoded) else None
+
+
+def _unpack_septets(raw_bytes):
+    """Standard GSM 03.38 unpacking: treat the byte stream as a continuous
+    LSB-first bit stream and pull out 7 bits at a time."""
+    septets = []
+    buffer = 0
+    bits_in_buffer = 0
+    for byte in raw_bytes:
+        buffer |= byte << bits_in_buffer
+        bits_in_buffer += 8
+        while bits_in_buffer >= 7:
+            septets.append(buffer & 0x7F)
+            buffer >>= 7
+            bits_in_buffer -= 7
+    return septets
+
+
 def decode_possible_hex(text):
-    """Try the simpler ASCII-hex interpretation first (2 hex digits/byte -
-    correct for most Kenyan telco content, which is plain Latin-script text
-    even when a network happens to hex-encode it), then UCS2 (4 hex
-    digits/UTF-16 unit) as a fallback for genuinely Unicode content. Both
-    checks require the result to look like real ASCII-range text rather than
-    just "some Unicode script or other" - Python's str.isprintable() accepts
-    CJK/etc, which caused false-positive UCS2 decodes of what was actually
-    plain ASCII-hex data. Returns the original text unchanged if it doesn't
-    look like hex at all, or if neither decode produces sensible output."""
-    if not looks_like_hex(text):
+    """Try, in order: the simpler ASCII-hex interpretation (2 hex
+    digits/byte - correct for most Kenyan telco content, which is plain
+    Latin-script text even when a network happens to hex-encode it), then
+    UCS2 (4 hex digits/UTF-16 unit) for genuinely Unicode content, then
+    (if the text doesn't look like hex at all AND doesn't already look like
+    clean text) packed 7-bit GSM septets for firmware that sends those raw
+    instead of hex-representing them. The "doesn't already look clean"
+    guard matters: without it, already-correct plain text could coincidence-
+    ally re-decode into different (wrong) text under the septet unpacking.
+    Every check requires the result to look like real ASCII-range text
+    rather than just "some Unicode script or other" - Python's
+    str.isprintable() accepts CJK/etc, which caused a false-positive decode
+    in an earlier version of this heuristic. Returns the original text
+    unchanged if nothing produces sensible output."""
+    if looks_like_hex(text):
+        return try_decode_ascii_hex(text) or try_decode_ucs2_hex(text) or text
+    if _mostly_ascii_printable(text):
         return text
-    return try_decode_ascii_hex(text) or try_decode_ucs2_hex(text) or text
+    return try_decode_packed_gsm7(text) or text
 
 
 def _mostly_ascii_printable(decoded):

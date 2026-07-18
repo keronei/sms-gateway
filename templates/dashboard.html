@@ -304,6 +304,10 @@
     <div class="card">
       <h2>USSD</h2>
       <p class="card-sub">Dial a code (e.g. balance check, bundle purchase). If the network expects a reply, this box turns into a reply field until the session ends.</p>
+      <div id="ussdResponseBox" style="display:none; margin-bottom:14px; background:var(--panel-alt); border:1px solid var(--border); border-radius:8px; padding:12px;">
+        <div class="section-title" style="margin-bottom:6px;">Network reply</div>
+        <div id="ussdResponseText" style="white-space:pre-wrap; font-size:13.5px;"></div>
+      </div>
       <div class="field">
         <label id="ussdInputLabel">USSD code</label>
         <input type="text" id="ussdInput" placeholder="*144#">
@@ -311,10 +315,6 @@
       <div class="btn-row">
         <button class="btn btn-primary" id="btnUssdSend">Send</button>
         <button class="btn btn-danger" id="btnUssdEnd" style="display:none;">End session</button>
-      </div>
-      <div id="ussdResponseBox" style="display:none; margin-top:12px; background:var(--panel-alt); border:1px solid var(--border); border-radius:8px; padding:12px;">
-        <div class="section-title" style="margin-bottom:6px;">Network reply</div>
-        <div id="ussdResponseText" style="white-space:pre-wrap; font-size:13.5px;"></div>
       </div>
       <div class="status-msg" id="ussdMsg"></div>
     </div>

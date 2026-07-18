@@ -545,6 +545,7 @@ function setUssdSessionUI(active) {
   $("#ussdInputLabel").textContent = active ? "Reply" : "USSD code";
   $("#ussdInput").placeholder = active ? "Type your reply…" : "*144#";
   $("#btnUssdEnd").style.display = active ? "inline-flex" : "none";
+  $("#ussdInput").style.borderColor = active ? "var(--amber)" : "";
 }
 
 $("#btnUssdSend").addEventListener("click", async () => {
@@ -559,7 +560,13 @@ $("#btnUssdSend").addEventListener("click", async () => {
     $("#ussdResponseBox").style.display = "block";
     $("#ussdResponseText").textContent = result.text || "(no text in reply)";
     setUssdSessionUI(result.session_state === 1);
-    showMsg($("#ussdMsg"), true, result.session_state === 1 ? "Reply needed — type below and Send again." : "Session ended.");
+    if (result.session_state === 1) {
+      showMsg($("#ussdMsg"), true, "Reply needed — the box below the network reply is now waiting for your reply.");
+      $("#ussdInput").focus();
+      $("#ussdInput").scrollIntoView({ behavior: "smooth", block: "center" });
+    } else {
+      showMsg($("#ussdMsg"), true, "Session ended.");
+    }
   } catch (e) {
     showMsg($("#ussdMsg"), false, e.message);
   } finally {
