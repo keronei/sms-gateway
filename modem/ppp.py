@@ -183,10 +183,34 @@ class PPPSupervisor:
             f.write("\n".join(lines) + "\n")
         return path
 
+    def _ensure_secrets_files(self):
+        """noauth (which we pass regardless) only means 'don't require the
+        peer to authenticate to us' - it does NOT stop the network from
+        challenging *us* for PAP/CHAP credentials during negotiation, which
+        many APNs do even when the actual credentials are trivial/blank.
+        Without an entry here, pppd has nothing to respond with and fails
+        with 'couldn't find any suitable secret'. Using '*' wildcards for
+        server/IP so this matches whatever the network asks for."""
+        username = self.username or ""
+        password = self.password or ""
+        entry = f'"{username}" * "{password}" *\n'
+        for fname in ("pap-secrets", "chap-secrets"):
+            path = f"/etc/ppp/{fname}"
+            try:
+                os.makedirs("/etc/ppp", exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(entry)
+                os.chmod(path, 0o600)  # pppd expects these to be root-only-readable
+            except OSError as e:
+                self._log("error", f"Could not write {path} ({e}) - PPP authentication will likely fail")
+                return False
+        return True
+
     def _dial_and_wait_for_ip(self):
         chat_path = self._write_chat_script()
         connect_cmd = f"{CHAT_BIN} -v -s -f {shlex.quote(chat_path)}"
         routing_via_file = self._ensure_tty_options_file()
+        self._ensure_secrets_files()
 
         args = [
             PPPD_BIN, self.data_port, str(self.baud),
@@ -195,13 +219,13 @@ class PPPSupervisor:
             "novj", "novjccomp", "nobsdcomp", "nodeflate",
             "lcp-echo-interval", "15", "lcp-echo-failure", "3",
             "maxfail", "1", "unit", str(PPP_UNIT), "nodetach",
+            "noauth",                    # we don't require the *peer* to authenticate to us
+            "user", self.username or "",  # our identity to offer if the network challenges us
         ]
         if not routing_via_file:
             # fallback to the old behaviour if we couldn't write the options
             # file (e.g. not actually root) - may still hit the privilege error
             args += ["defaultroute", "replacedefaultroute", "usepeerdns"]
-        args += ["user", self.username] if self.username else []
-        args += ["password", self.password] if self.password else (["noauth"] if not self.username else [])
 
         try:
             self._proc = subprocess.Popen(
