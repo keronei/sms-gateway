@@ -8,8 +8,8 @@ StartLimitIntervalSec=0
 # serial ports (dialout), pppd (dip), and GPIO (gpio). See README "Modem
 # daemon setup" for the exact `usermod` commands.
 User=root
-WorkingDirectory=/home/pi/sms-dashboard
-ExecStart=/home/pi/sms-dashboard/venv/bin/python3 /home/pi/sms-dashboard/run_modem_manager.py
+WorkingDirectory=/home/pisms/sms-dashboard
+ExecStart=/home/pisms/sms-dashboard/venv/bin/python3 /home/pisms/sms-dashboard/run_modem_manager.py
 Restart=always
 RestartSec=5
 
