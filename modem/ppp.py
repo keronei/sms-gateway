@@ -228,19 +228,24 @@ class PPPSupervisor:
             args += ["defaultroute", "replacedefaultroute", "usepeerdns"]
 
         try:
-            self._proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
             )
         except FileNotFoundError:
             self._log("error", f"{PPPD_BIN} not found - is the 'ppp' package installed? (sudo apt install ppp)")
             return None
+        self._proc = proc  # shared handle so _kill_pppd() (possibly called from
+                            # another thread, e.g. a manual reconnect) can find it
 
-        threading.Thread(target=self._drain_pppd_output, args=(self._proc,), daemon=True).start()
+        threading.Thread(target=self._drain_pppd_output, args=(proc,), daemon=True).start()
 
         deadline = time.time() + CONNECT_TIMEOUT
         while time.time() < deadline:
-            if self._proc.poll() is not None:
-                code = self._proc.returncode
+            # use the local `proc` reference, not self._proc - a concurrent
+            # request_reconnect() can null out self._proc mid-loop from
+            # another thread, which would otherwise crash this poll() call
+            if proc.poll() is not None:
+                code = proc.returncode
                 hint = PPPD_EXIT_CODES.get(code, "see pppd(8) EXIT STATUS for what this code means")
                 self._log("error", f"pppd exited early (code {code}: {hint})")
                 db.update_modem_status(ppp_last_error=f"pppd exited with code {code} ({hint})")
@@ -267,9 +272,10 @@ class PPPSupervisor:
             pass
 
     def _monitor_until_dropped(self):
+        proc = self._proc
         while not self._stop.is_set() and not self._reconnect_now.is_set():
             time.sleep(MONITOR_INTERVAL)
-            if self._proc is None or self._proc.poll() is not None:
+            if proc is None or proc.poll() is not None:
                 return
             if not self._read_interface_ip(PPP_IFACE):
                 return
