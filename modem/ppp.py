@@ -140,6 +140,29 @@ class PPPSupervisor:
             time.sleep(min(0.5, max(0.0, end - time.time())))
 
     # ------------------------------------------------------------- dialing
+    def _ensure_tty_options_file(self):
+        """pppd treats options in this per-device file as coming from a
+        trusted, root-owned source, unlike the same options passed on the
+        command line (which some pppd builds subject to stricter UID
+        checks - this is what "using the ... option requires root
+        privilege" is about, even when the invoking process genuinely is
+        root). Writing here also fails loudly if we're NOT actually root,
+        which is itself a useful diagnostic."""
+        tty_name = os.path.basename(self.data_port)
+        path = f"/etc/ppp/options.{tty_name}"
+        content = "defaultroute\nreplacedefaultroute\nusepeerdns\n"
+        try:
+            os.makedirs("/etc/ppp", exist_ok=True)
+            with open(path, "w") as f:
+                f.write(content)
+            os.chmod(path, 0o644)
+        except OSError as e:
+            self._log("error", f"Could not write {path} ({e}) - is this daemon actually running as root? "
+                                f"Falling back to passing routing options on the pppd command line, which may "
+                                f"itself fail with 'requires root privilege' if not.")
+            return False
+        return True
+
     def _write_chat_script(self):
         path = os.path.join(RUNTIME_DIR, "chat_connect")
         apn = self.apn or "internet"
@@ -163,15 +186,20 @@ class PPPSupervisor:
     def _dial_and_wait_for_ip(self):
         chat_path = self._write_chat_script()
         connect_cmd = f"{CHAT_BIN} -v -s -f {shlex.quote(chat_path)}"
+        routing_via_file = self._ensure_tty_options_file()
 
         args = [
             PPPD_BIN, self.data_port, str(self.baud),
             "connect", connect_cmd,
-            "noipdefault", "defaultroute", "replacedefaultroute", "usepeerdns",
+            "noipdefault",
             "novj", "novjccomp", "nobsdcomp", "nodeflate",
             "lcp-echo-interval", "15", "lcp-echo-failure", "3",
             "maxfail", "1", "unit", str(PPP_UNIT), "nodetach",
         ]
+        if not routing_via_file:
+            # fallback to the old behaviour if we couldn't write the options
+            # file (e.g. not actually root) - may still hit the privilege error
+            args += ["defaultroute", "replacedefaultroute", "usepeerdns"]
         args += ["user", self.username] if self.username else []
         args += ["password", self.password] if self.password else (["noauth"] if not self.username else [])
 
