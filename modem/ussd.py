@@ -33,6 +33,7 @@ block with a loose regex that takes "first quote to last quote" as the text
 rather than stopping at the first embedded quote.
 """
 import re
+import time
 import threading
 
 from modem import text_codec
@@ -43,7 +44,13 @@ from modem import text_codec
 CUSD_RE = re.compile(r'^\+CUSD:\s*(\d)\s*,\s*"(.*)"\s*(?:,\s*(\d+))?\s*$', re.DOTALL)
 CUSD_START_RE = re.compile(r'^\+CUSD:')
 
-BUFFER_SETTLE_SECONDS = 0.5  # gap after which we treat a buffered reply as complete
+BUFFER_SETTLE_SECONDS = 0.5   # safety-net gap if nothing ever cleanly matches
+MAX_BUFFER_SECONDS = 5.0      # absolute cap - a real multi-line reply arrives
+                               # in a fast burst (well under a second in
+                               # practice); if lines keep trickling in past
+                               # this, something unrelated is being swept
+                               # into the buffer - force a flush rather than
+                               # risk buffering forever and never resolving
 
 
 class UssdWaiter:
@@ -52,22 +59,50 @@ class UssdWaiter:
         self._result = None
         self._lock = threading.Lock()
         self._buffer = None
+        self._buffer_start = None
         self._settle_timer = None
 
     def on_urc_line(self, line):
-        """Returns True if this line was consumed as part of a +CUSD: reply
-        (possibly still awaiting more lines before it's complete)."""
+        """Returns True if this line was consumed as part of a +CUSD: reply.
+        Resolves as soon as the buffered content forms a complete match -
+        the common case (a well-formed single-line reply, including ones
+        with a stray embedded quote) resolves immediately with no added
+        delay. Only a genuinely incomplete multi-line reply waits for more
+        lines, bounded by MAX_BUFFER_SECONDS so it can never hang forever."""
         stripped = line.rstrip("\r\n")
+        to_finish = []
+
         with self._lock:
+            if self._buffer is not None and (time.time() - self._buffer_start) >= MAX_BUFFER_SECONDS:
+                # been buffering too long without a clean match - give up on
+                # it and finalize whatever we have, then re-evaluate this
+                # line fresh below
+                to_finish.append("\n".join(self._buffer))
+                self._clear_buffer_locked()
+
             if self._buffer is not None:
                 self._buffer.append(stripped)
-                self._reset_settle_timer()
-                return True
-            if not CUSD_START_RE.match(stripped.strip()):
-                return False
-            self._buffer = [stripped]
-            self._reset_settle_timer()
-            return True
+                combined = "\n".join(self._buffer)
+                if CUSD_RE.match(combined.strip()):
+                    to_finish.append(combined)
+                    self._clear_buffer_locked()
+                else:
+                    self._reset_settle_timer()
+                consumed = True
+            elif CUSD_START_RE.match(stripped.strip()):
+                if CUSD_RE.match(stripped.strip()):
+                    to_finish.append(stripped)
+                else:
+                    self._buffer = [stripped]
+                    self._buffer_start = time.time()
+                    self._reset_settle_timer()
+                consumed = True
+            else:
+                consumed = False
+
+        for combined in to_finish:
+            self._finish(combined)
+        return consumed
 
     def _reset_settle_timer(self):
         if self._settle_timer:
@@ -76,12 +111,20 @@ class UssdWaiter:
         self._settle_timer.daemon = True
         self._settle_timer.start()
 
+    def _clear_buffer_locked(self):
+        """Caller must hold self._lock."""
+        self._buffer = None
+        self._buffer_start = None
+        if self._settle_timer:
+            self._settle_timer.cancel()
+            self._settle_timer = None
+
     def _flush_buffer(self):
         with self._lock:
             if self._buffer is None:
                 return
             combined = "\n".join(self._buffer)
-            self._buffer = None
+            self._clear_buffer_locked()
         self._finish(combined)
 
     def _finish(self, combined):
