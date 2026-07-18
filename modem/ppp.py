@@ -166,6 +166,7 @@ class PPPSupervisor:
     def _write_chat_script(self):
         path = os.path.join(RUNTIME_DIR, "chat_connect")
         apn = self.apn or "internet"
+        cid = 1
         lines = [
             "ABORT 'BUSY'",
             "ABORT 'NO CARRIER'",
@@ -175,8 +176,12 @@ class PPPSupervisor:
             "TIMEOUT 25",
             "'' AT",
             "OK ATE0",
-            f'OK AT+CGDCONT=1,"IP","{apn}"',
-            "OK ATD*99#",
+            f'OK AT+CGDCONT={cid},"IP","{apn}"',
+            # explicit CID (matching CGDCONT above) rather than the bare
+            # ATD*99# form - some firmware/carriers reject the implicit-
+            # default-context dial with a plain ERROR even when that
+            # context was just successfully defined
+            f"OK ATD*99***{cid}#",
             "CONNECT ''",
         ]
         with open(path, "w") as f:
