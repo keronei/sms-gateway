@@ -16,26 +16,88 @@ network just knows which session it belongs to. AT+CUSD=2 ends a session.
 <m> (session state) values: 0 = no further action needed (session over),
 1 = further action required (network expects a reply), 2 = terminated by
 network, 4 = operation not supported, 5 = network timeout.
+
+Real device output is messier than the spec suggests, in two ways this
+module has to tolerate:
+  - the quoted <str> can itself contain literal embedded newlines (e.g. a
+    multi-item bundle menu), which arrives as several physical lines even
+    though it's logically one response
+  - the quoted <str> can contain an unescaped '"' byte (e.g. when it's
+    actually raw packed 7-bit GSM septet garbage - a coincidental byte
+    value, not a real quote), which breaks strict quote-matching
+
+Both are handled by buffering: once a line starts a "+CUSD:" response, keep
+appending subsequent lines until there's a brief pause in arrival (real
+multi-line responses arrive in a fast burst), then parse the whole buffered
+block with a loose regex that takes "first quote to last quote" as the text
+rather than stopping at the first embedded quote.
 """
 import re
 import threading
 
 from modem import text_codec
 
-CUSD_RE = re.compile(r'^\+CUSD:\s*(\d)(?:\s*,\s*"((?:[^"\\]|\\.)*)"(?:\s*,\s*(\d+))?)?\s*$')
+# Loose on purpose: DOTALL so '.' matches embedded newlines, and a greedy
+# match up to the LAST quote (not the first) so a stray '"' byte inside
+# garbled/packed content doesn't truncate the text early.
+CUSD_RE = re.compile(r'^\+CUSD:\s*(\d)\s*,\s*"(.*)"\s*(?:,\s*(\d+))?\s*$', re.DOTALL)
+CUSD_START_RE = re.compile(r'^\+CUSD:')
+
+BUFFER_SETTLE_SECONDS = 0.5  # gap after which we treat a buffered reply as complete
 
 
 class UssdWaiter:
     def __init__(self):
         self._event = threading.Event()
         self._result = None
+        self._lock = threading.Lock()
+        self._buffer = None
+        self._settle_timer = None
 
     def on_urc_line(self, line):
-        """Returns True if this line was a +CUSD: reply and has been consumed."""
-        m = CUSD_RE.match(line.strip())
-        if not m:
-            return False
-        state_str, raw_text, dcs_str = m.groups()
+        """Returns True if this line was consumed as part of a +CUSD: reply
+        (possibly still awaiting more lines before it's complete)."""
+        stripped = line.rstrip("\r\n")
+        with self._lock:
+            if self._buffer is not None:
+                self._buffer.append(stripped)
+                self._reset_settle_timer()
+                return True
+            if not CUSD_START_RE.match(stripped.strip()):
+                return False
+            self._buffer = [stripped]
+            self._reset_settle_timer()
+            return True
+
+    def _reset_settle_timer(self):
+        if self._settle_timer:
+            self._settle_timer.cancel()
+        self._settle_timer = threading.Timer(BUFFER_SETTLE_SECONDS, self._flush_buffer)
+        self._settle_timer.daemon = True
+        self._settle_timer.start()
+
+    def _flush_buffer(self):
+        with self._lock:
+            if self._buffer is None:
+                return
+            combined = "\n".join(self._buffer)
+            self._buffer = None
+        self._finish(combined)
+
+    def _finish(self, combined):
+        m = CUSD_RE.match(combined.strip())
+        if m:
+            state_str, raw_text, dcs_str = m.groups()
+        else:
+            # even the loose regex couldn't match (unusual) - still resolve
+            # rather than leave the caller hanging until timeout, using
+            # whatever session-state digit we can find and the raw block as
+            # the text so nothing is silently lost
+            m2 = re.match(r'^\+CUSD:\s*(\d)', combined.strip())
+            state_str = m2.group(1) if m2 else "0"
+            raw_text = combined
+            dcs_str = None
+
         dcs = int(dcs_str) if dcs_str is not None else 15
         text = decode_ussd_text(dcs, raw_text or "")
         self._result = {
@@ -45,7 +107,6 @@ class UssdWaiter:
             "dcs": dcs,
         }
         self._event.set()
-        return True
 
     def wait_for_reply(self, timeout=30):
         self._event.clear()
@@ -73,7 +134,7 @@ def _escape(text):
 def decode_ussd_text(dcs, text):
     """dcs=15 (and 0) are meant to be plain text per the module's own docs,
     but real devices/carriers are inconsistent about honoring that - so even
-    for dcs=15 we run the same "does this actually look like hex that needs
-    decoding" check used for SMS bodies, rather than trusting the flag
-    blindly. See text_codec.py for the ASCII-hex/UCS2 detection logic."""
+    for dcs=15 we run the same "does this actually look like hex/packed
+    septets that need decoding" check used for SMS bodies, rather than
+    trusting the flag blindly. See text_codec.py for that logic."""
     return text_codec.decode_possible_hex(text)
