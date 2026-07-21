@@ -226,6 +226,9 @@ class PPPSupervisor:
             "maxfail", "1", "unit", str(PPP_UNIT), "nodetach",
             "noauth",                    # we don't require the *peer* to authenticate to us
             "user", self.username or "",  # our identity to offer if the network challenges us
+            "refuse-chap",                # Safaricom's APN profile specifies PAP - don't let
+                                           # LCP negotiate CHAP instead, mirroring a known-working
+                                           # device's exact auth configuration on this network
         ]
         if not routing_via_file:
             # fallback to the old behaviour if we couldn't write the options
