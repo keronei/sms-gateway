@@ -419,6 +419,23 @@ def api_modem_send():
     return jsonify({"command_id": cmd_id})
 
 
+@app.route("/api/modem/calls")
+def api_modem_calls():
+    return jsonify(db.get_call_log())
+
+
+@app.route("/api/modem/calls/<int:call_id>", methods=["DELETE"])
+def api_modem_call_delete(call_id):
+    db.delete_call_log_entry(call_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/modem/calls", methods=["DELETE"])
+def api_modem_calls_clear():
+    db.clear_call_log()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/modem/ussd/send", methods=["POST"])
 def api_modem_ussd_send():
     body = request.get_json(force=True) or {}

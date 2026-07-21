@@ -134,8 +134,21 @@ def init_db():
                 ussd_active INTEGER DEFAULT 0,        -- true while a session awaits our reply
                 ussd_last_message TEXT,                -- last decoded text from the network
                 ussd_last_state INTEGER,               -- last <m> code (0=done,1=reply needed,2/4/5=error)
-                ussd_updated_at REAL
+                ussd_updated_at REAL,
+
+                last_caller TEXT,                      -- most recent incoming call's number (via +CLIP)
+                last_call_at REAL
             );
+
+            CREATE TABLE IF NOT EXISTS modem_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller_number TEXT,           -- NULL until +CLIP arrives, or stays NULL if withheld
+                ring_count INTEGER DEFAULT 1,
+                first_ring_at REAL NOT NULL,
+                last_ring_at REAL NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_modem_calls_first_ring ON modem_calls(first_ring_at);
 
             CREATE TABLE IF NOT EXISTS modem_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -458,3 +471,54 @@ def delete_modem_inbox_message(inbox_id):
     # this only ever deletes our durable DB copy.
     with get_conn() as conn:
         conn.execute("DELETE FROM modem_inbox WHERE id = ?", (inbox_id,))
+
+
+# -------------------------------------------------------------- call log
+def log_call_ring(number=None):
+    """Starts a new call-log entry (first RING/CLIP of a call not already
+    being tracked). Returns the new entry's id."""
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO modem_calls (caller_number, ring_count, first_ring_at, last_ring_at, created_at)
+               VALUES (?, 1, ?, ?, ?)""",
+            (number, now, now, now),
+        )
+        return cur.lastrowid
+
+
+def bump_call_ring(call_id):
+    """A repeat RING for a call already being tracked - same call, not a new one."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE modem_calls SET ring_count = ring_count + 1, last_ring_at = ? WHERE id = ?",
+            (time.time(), call_id),
+        )
+
+
+def update_call_number(call_id, number):
+    """Fills in the caller's number once +CLIP arrives for a call that was
+    first logged from a bare RING (number not yet known)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE modem_calls SET caller_number = ?, last_ring_at = ? WHERE id = ?",
+            (number, time.time(), call_id),
+        )
+
+
+def get_call_log(limit=200):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM modem_calls ORDER BY first_ring_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_call_log_entry(call_id):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM modem_calls WHERE id = ?", (call_id,))
+
+
+def clear_call_log():
+    with get_conn() as conn:
+        conn.execute("DELETE FROM modem_calls")

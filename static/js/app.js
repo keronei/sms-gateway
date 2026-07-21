@@ -636,6 +636,7 @@ function renderModemStatus(s) {
   }
   if (s.ppp_last_error) rows.push(["Last PPP error", s.ppp_last_error]);
   if (s.ussd_active) rows.push(["USSD session", "Awaiting your reply"]);
+  if (s.last_caller) rows.push(["Last caller", `${s.last_caller}${s.last_call_at ? " (" + new Date(s.last_call_at * 1000).toLocaleString() + ")" : ""}`]);
 
   $("#modemDetails").innerHTML = rows.map(([label, value]) => `
     <div class="field" style="margin-bottom:4px;">
@@ -678,6 +679,45 @@ $("#btnModemReconnect").addEventListener("click", async () => {
     await api("/api/modem/reconnect", { method: "POST" });
     showMsg($("#modemActionMsg"), true, "Reconnect requested — watch the log below.");
   } catch (e) { showMsg($("#modemActionMsg"), false, e.message); }
+});
+
+// -------------------------------------------------------------- call log
+$("#btnShowCallLog").addEventListener("click", async () => {
+  $("#callLogModal").style.display = "flex";
+  await loadCallLog();
+});
+$("#btnCloseCallLog").addEventListener("click", () => {
+  $("#callLogModal").style.display = "none";
+});
+$("#callLogModal").addEventListener("click", (e) => {
+  if (e.target.id === "callLogModal") $("#callLogModal").style.display = "none";
+});
+
+async function loadCallLog() {
+  const calls = await api("/api/modem/calls");
+  const tbody = $("#callLogTableBody");
+  if (!calls.length) {
+    tbody.innerHTML = `<tr><td colspan="4"><div class="empty-state">No calls recorded yet.</div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = calls.map(c => `
+    <tr>
+      <td class="mono">${escapeHtml(c.caller_number || "Unknown")}</td>
+      <td class="mono" style="color:var(--muted);">${new Date(c.first_ring_at * 1000).toLocaleString()}</td>
+      <td>${c.ring_count}</td>
+      <td><button class="btn btn-danger" onclick="deleteCallLogEntry(${c.id})">Delete</button></td>
+    </tr>`).join("");
+}
+
+window.deleteCallLogEntry = async function (id) {
+  await api(`/api/modem/calls/${id}`, { method: "DELETE" });
+  loadCallLog();
+};
+
+$("#btnClearCallLog").addEventListener("click", async () => {
+  if (!confirm("Clear the entire call log?")) return;
+  await api("/api/modem/calls", { method: "DELETE" });
+  loadCallLog();
 });
 
 // ---------------------------------------------------------------- history
