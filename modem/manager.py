@@ -9,6 +9,7 @@ Run via: python3 -m modem.manager   (or the run_modem_manager.py wrapper,
 which is what the systemd unit actually invokes).
 """
 import os
+import re
 import sys
 import time
 import json
@@ -26,6 +27,8 @@ NETWORK_INFO_INTERVAL = 60  # seconds between signal/registration refreshes
 POWER_ON_SETTLE = 12        # seconds to let the module boot/enumerate USB after a power pulse
 COMMAND_POLL_INTERVAL = 1.5  # seconds between checks of modem_commands
 INBOX_FALLBACK_POLL = 20    # seconds between inbox drains even without a +CMTI URC
+CALL_GAP_SECONDS = 10        # RING/+CLIP within this long of the last one = same call
+SIM_SETTLE_SECONDS = 2        # wait after a PIN unlock before touching SMS/USSD/CLIP
 
 
 class ModemManager:
@@ -39,6 +42,8 @@ class ModemManager:
         self._inbox_dirty = threading.Event()
         self._ussd_waiter = ussd.UssdWaiter()
         self._ppp_config_snapshot = None
+        self._current_call_id = None
+        self._current_call_last_ring = 0.0
 
     # ------------------------------------------------------------- utils
     def reload_settings(self):
@@ -144,6 +149,40 @@ class ModemManager:
         ch.send("ATE0")           # echo off - cleaner parsing on our side
         ch.send("AT+CMEE=2")      # verbose +CME/+CMS error strings instead of bare numbers
 
+        # unlock the SIM FIRST - AT+CSCS and the SMS/USSD/CLIP setup below are
+        # all guaranteed to fail while the SIM is PIN-locked, so there's no
+        # point attempting them before this
+        sim_status, just_unlocked = self._check_and_unlock_sim(ch)
+        db.update_modem_status(at_ready=True, sim_status=sim_status)
+        self.log("info", "at", f"Control channel ready on {ch.port}; SIM status: {sim_status}")
+
+        if just_unlocked:
+            # many modules need a moment to finish mounting the SIM (storage,
+            # phonebook, etc.) right after a PIN is accepted - issuing SMS/
+            # USSD-related commands too soon commonly fails with a generic
+            # CMS/CME error that has nothing to do with the command itself
+            self.log("info", "sim", f"Waiting {SIM_SETTLE_SECONDS}s for the SIM to settle after PIN unlock")
+            self._sleep(SIM_SETTLE_SECONDS)
+
+        self._set_charset(ch)
+        self._configure_sms(ch, retry_after_settle=just_unlocked)
+
+        try:
+            ch.send("AT^USSDMODE=0")
+            self.log("info", "ussd", "USSD non-transparent mode set")
+        except (ATError, ATTimeout) as e:
+            self.log("warn", "ussd", f"AT^USSDMODE=0 failed (continuing anyway): {e}")
+
+        try:
+            ch.send("AT+CLIP=1")
+            self.log("info", "call", "Caller ID presentation enabled (AT+CLIP=1)")
+        except (ATError, ATTimeout) as e:
+            self.log("warn", "call", f"AT+CLIP=1 failed - incoming calls will show without a number: {e}")
+
+        self._refresh_network_info()
+        self._inbox_dirty.set()  # sweep for anything already sitting on the SIM
+
+    def _set_charset(self, ch):
         try:
             ch.send('AT+CSCS="IRA"')
             self.log("info", "at", "Character set set to IRA (plain ASCII pass-through)")
@@ -152,55 +191,58 @@ class ModemManager:
             # instead of readable without this - see text_codec.py's fallback.
             self.log("warn", "at", f"AT+CSCS=\"IRA\" failed (continuing anyway): {e}")
 
-        sim_status = self._check_and_unlock_sim(ch)
-
-        db.update_modem_status(at_ready=True, sim_status=sim_status)
-        self.log("info", "at", f"Control channel ready on {ch.port}; SIM status: {sim_status}")
-
+    def _configure_sms(self, ch, retry_after_settle=False):
         try:
             sms.configure(ch)
             self.log("info", "sms", "Text mode configured (AT+CMGF=1, AT+CNMI=2,1,0,0,0)")
+            return
         except (ATError, ATTimeout) as e:
             self.log("error", "sms", f"Failed to configure SMS text mode: {e}")
-
+        if not retry_after_settle:
+            return
+        # one retry with a longer wait, in case the SIM needed more than the
+        # initial settle window
+        self._sleep(2)
         try:
-            ch.send("AT^USSDMODE=0")
-            self.log("info", "ussd", "USSD non-transparent mode set")
+            sms.configure(ch)
+            self.log("info", "sms", "Text mode configured on retry")
         except (ATError, ATTimeout) as e:
-            self.log("warn", "ussd", f"AT^USSDMODE=0 failed (continuing anyway): {e}")
-
-        self._refresh_network_info()
-        self._inbox_dirty.set()  # sweep for anything already sitting on the SIM
+            self.log("error", "sms", f"SMS text mode retry also failed: {e}")
 
     def _check_and_unlock_sim(self, ch):
         """Checks AT+CPIN? and, if the SIM is locked, attempts to unlock it
         with whatever PIN is currently configured. Shared by init and by the
         periodic retry in _apply_live_settings_changes(), so entering a PIN
         in Settings after the SIM already came up locked actually gets
-        applied without needing a full daemon/channel restart."""
+        applied without needing a full daemon/channel restart.
+
+        Returns (status, just_unlocked) - just_unlocked is True only when a
+        PIN was actually submitted and accepted on THIS call, so callers can
+        apply a settle delay only when it's actually needed (a SIM that was
+        already ready needs no extra wait)."""
         try:
             resp = ch.send("AT+CPIN?")
             text = resp.text
         except ATError as e:
             self.log("error", "sim", f"AT+CPIN? failed: {e}")
-            return "absent"
+            return "absent", False
 
         if "READY" in text:
-            return "ready"
+            return "ready", False
         if "SIM PIN" not in text:
-            return "error"
+            return "error", False
 
         pin = self.settings.get("modem_sim_pin")
         if not pin:
             self.log("warn", "sim", "SIM requires a PIN but none is configured in Settings")
-            return "pin_required"
+            return "pin_required", False
         try:
             ch.send(f'AT+CPIN="{pin}"')
             self.log("info", "sim", "SIM PIN accepted")
-            return "ready"
+            return "ready", True
         except ATError as e:
             self.log("error", "sim", f"SIM PIN rejected: {e}")
-            return "pin_error"
+            return "pin_error", False
 
     # -------------------------------------------------------------- ppp
     def _ppp_config(self):
@@ -265,9 +307,22 @@ class ModemManager:
 
         status = db.get_modem_status()
         if status.get("sim_status") in ("pin_required", "pin_error") and self.settings.get("modem_sim_pin"):
-            new_status = self._check_and_unlock_sim(self.control_channel)
+            new_status, just_unlocked = self._check_and_unlock_sim(self.control_channel)
             if new_status != status.get("sim_status"):
                 db.update_modem_status(sim_status=new_status)
+            if just_unlocked:
+                self.log("info", "sim", f"Waiting {SIM_SETTLE_SECONDS}s for the SIM to settle after live PIN unlock")
+                self._sleep(SIM_SETTLE_SECONDS)
+                self._set_charset(self.control_channel)
+                self._configure_sms(self.control_channel, retry_after_settle=True)
+                try:
+                    self.control_channel.send("AT^USSDMODE=0")
+                except (ATError, ATTimeout):
+                    pass
+                try:
+                    self.control_channel.send("AT+CLIP=1")
+                except (ATError, ATTimeout):
+                    pass
 
         return False
 
@@ -314,6 +369,36 @@ class ModemManager:
             # thread itself, and send() waits on an event that same thread
             # sets; calling it from here would deadlock. Just flag it.
             self._inbox_dirty.set()
+        elif line.strip() == "RING":
+            self._handle_ring()
+        elif line.startswith("+CLIP:"):
+            self._handle_clip(line)
+
+    # ---------------------------------------------------------------- calls
+    def _handle_ring(self):
+        """A bare RING with no number yet - +CLIP normally follows within
+        the same ring cycle, but log something now regardless so a call
+        that never gets a CLIP (withheld/unsupported) still shows up."""
+        now = time.time()
+        if self._current_call_id is None or (now - self._current_call_last_ring) > CALL_GAP_SECONDS:
+            self._current_call_id = db.log_call_ring(number=None)
+            self.log("info", "call", "Incoming call ringing (no caller ID yet)")
+        else:
+            db.bump_call_ring(self._current_call_id)
+        self._current_call_last_ring = now
+        db.update_modem_status(last_call_at=now)
+
+    def _handle_clip(self, line):
+        m = re.match(r'^\+CLIP:\s*"([^"]*)"', line.strip())
+        number = (m.group(1) if m else "").strip() or "Withheld/unknown"
+        now = time.time()
+        if self._current_call_id is None or (now - self._current_call_last_ring) > CALL_GAP_SECONDS:
+            self._current_call_id = db.log_call_ring(number=number)
+        else:
+            db.update_call_number(self._current_call_id, number)
+        self._current_call_last_ring = now
+        db.update_modem_status(last_caller=number, last_call_at=now)
+        self.log("info", "call", f"Incoming call from {number}")
 
     # --------------------------------------------------------------- inbox
     def _inbox_poll_loop(self):

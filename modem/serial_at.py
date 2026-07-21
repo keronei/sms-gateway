@@ -28,7 +28,7 @@ import serial
 # registration reporting, this will need smarter disambiguation (e.g. by
 # param count) rather than a blanket prefix match.
 FORCE_URC_PREFIXES = (
-    "+CMTI:", "+CDS:", "+CMT:",
+    "+CMTI:", "+CDS:", "+CMT:", "+CLIP:",
     "^SYSSTART", "^MODE:", "^BOOT:", "^SIMST:", "^HCSQ:", "RING",
 )
 
