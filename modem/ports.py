@@ -7,10 +7,12 @@ session (i.e. never probe the data port while PPP is up).
 import time
 import serial
 
+from modem.huawei_serial import HuaweiSerial
+
 
 def probe_port(port, baudrate=115200, timeout=2.0):
     try:
-        with serial.Serial(port, baudrate, timeout=timeout) as ser:
+        with HuaweiSerial(port, baudrate, timeout=timeout) as ser:
             ser.reset_input_buffer()
             ser.write(b"AT\r")
             ser.flush()
