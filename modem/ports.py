@@ -7,7 +7,7 @@ session (i.e. never probe the data port while PPP is up).
 import time
 import serial
 
-from modem.huawei_serial import HuaweiSerial
+from huawei_modem.huawei_serial import HuaweiSerial
 
 
 def probe_port(port, baudrate=115200, timeout=2.0):
