@@ -29,6 +29,8 @@ COMMAND_POLL_INTERVAL = 1.5  # seconds between checks of modem_commands
 INBOX_FALLBACK_POLL = 20    # seconds between inbox drains even without a +CMTI URC
 CALL_GAP_SECONDS = 10        # RING/+CLIP within this long of the last one = same call
 SIM_SETTLE_SECONDS = 2        # wait after a PIN unlock before touching SMS/USSD/CLIP
+HEALTH_CHECK_RETRIES = 3      # ping attempts before declaring the control port dead
+HEALTH_CHECK_RETRY_GAP = 3    # seconds between those retries
 
 
 class ModemManager:
@@ -276,8 +278,8 @@ class ModemManager:
             self._sleep(AT_HEALTH_INTERVAL)
             if self._stop.is_set():
                 return
-            if not self.control_channel.ping(timeout=3):
-                self.log("error", "at", "Control port stopped responding; will attempt recovery")
+            if not self._ping_with_retries():
+                self.log("error", "at", "Control port stopped responding after retries; will attempt recovery")
                 db.update_modem_status(at_ready=False, device_present=False)
                 self._teardown_control_channel()
                 return
@@ -286,6 +288,24 @@ class ModemManager:
                 return  # control port changed - let the outer loop reopen it
             if time.time() - self._last_network_refresh > NETWORK_INFO_INTERVAL:
                 self._refresh_network_info()
+
+    def _ping_with_retries(self):
+        """A module can briefly stop responding to AT commands during
+        network registration or a RAT handover (e.g. 2G<->3G) - this is
+        normal firmware behavior, not a real failure. Retry a few times
+        with short gaps before concluding the control channel is actually
+        dead, rather than triggering a full teardown+power-cycle over a
+        single slow response."""
+        for attempt in range(HEALTH_CHECK_RETRIES):
+            if self.control_channel.ping(timeout=3):
+                if attempt > 0:
+                    self.log("info", "at",
+                             f"Control port responded again after {attempt} retry(ies) - "
+                             f"likely a brief busy period (e.g. network registration)")
+                return True
+            if attempt < HEALTH_CHECK_RETRIES - 1:
+                self._sleep(HEALTH_CHECK_RETRY_GAP)
+        return False
 
     def _apply_live_settings_changes(self):
         """Picks up Settings edits made while this component is already

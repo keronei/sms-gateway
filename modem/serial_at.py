@@ -16,7 +16,7 @@ build on top of it.
 """
 import re
 import threading
-import serial
+from modem.serial_transport import HuaweiSerial
 
 # URCs that can plausibly interleave with a command's response and must
 # never be swallowed into that response, even if we're mid-command when
@@ -85,7 +85,13 @@ class ATChannel:
         return self._ser is not None and self._ser.is_open
 
     def open(self):
-        self._ser = serial.Serial(self.port, self.baudrate, timeout=self.read_timeout)
+        # HuaweiSerial claims exclusive access (TIOCEXCL) internally, so a
+        # second process (e.g. minicom, for manual testing) trying to open
+        # this same port fails immediately with a clear "device busy" error,
+        # instead of silently sharing the port and corrupting both sides'
+        # AT command traffic.
+        self._ser = HuaweiSerial(self.port, self.baudrate, timeout=self.read_timeout)
+        self._ser.open()
         self._stop.clear()
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
@@ -106,7 +112,7 @@ class ATChannel:
         while not self._stop.is_set():
             try:
                 chunk = self._ser.read(256)
-            except (serial.SerialException, OSError, TypeError):
+            except (OSError, TypeError):
                 break
             if not chunk:
                 continue

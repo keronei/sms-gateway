@@ -7,6 +7,11 @@
 # character-device interface changed) and often fails to build against
 # newer Python versions. gpiozero auto-detects and uses lgpio with no code
 # changes needed on our side.
-pyserial>=3.5
+#
+# pyserial is NOT needed: modem/serial_transport.py talks to the AT ports
+# directly via os/termios/select. This was a deliberate switch away from
+# pyserial - its normal open() sequence touches DTR-related modem-control
+# lines that this module's ttyUSB2 interface doesn't support, causing a
+# BrokenPipeError there. The custom transport avoids that entirely.
 gpiozero>=2.0
 lgpio>=0.2.2

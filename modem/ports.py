@@ -5,19 +5,16 @@ this on a port that's already owned by an open ATChannel or an active pppd
 session (i.e. never probe the data port while PPP is up).
 """
 import time
-import serial
-
-from modem.huawei_serial import HuaweiSerial
+from modem.serial_transport import HuaweiSerial
 
 
 def probe_port(port, baudrate=115200, timeout=2.0):
     try:
         with HuaweiSerial(port, baudrate, timeout=timeout) as ser:
-            ser.reset_input_buffer()
+            ser.flush_input()
             ser.write(b"AT\r")
-            ser.flush()
             time.sleep(0.3)
             data = ser.read(256)
             return b"OK" in data
-    except (serial.SerialException, OSError):
+    except OSError:
         return False
