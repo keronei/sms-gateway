@@ -32,6 +32,13 @@ FORCE_URC_PREFIXES = (
     "^SYSSTART", "^MODE:", "^BOOT:", "^SIMST:", "^HCSQ:", "RING",
 )
 
+# these prefixes' actual payload (a PDU hex string) arrives as a SEPARATE
+# following line that isn't itself prefix-matched - that line must also be
+# forced to the URC callback unconditionally, or it risks being swallowed
+# into an unrelated command's response if one happens to be pending at that
+# exact moment (a real bug this project has hit before with multi-line URCs).
+FORCE_URC_FOLLOWUP_PREFIXES = ("+CDS:", "+CMT:")
+
 TERMINAL_RE = re.compile(r"^(OK|ERROR|\+CME ERROR|\+CMS ERROR)")
 
 
@@ -79,6 +86,7 @@ class ATChannel:
         self._resp_event = threading.Event()
         self._prompt_event = threading.Event()
         self._buf = b""
+        self._force_next_urc_line = False
 
     @property
     def is_open(self):
@@ -132,7 +140,18 @@ class ATChannel:
                 self._handle_line(text)
 
     def _handle_line(self, text):
+        if self._force_next_urc_line:
+            self._force_next_urc_line = False
+            try:
+                self.urc_callback(text)
+            except Exception:
+                pass
+            return
+
         is_forced_urc = any(text.startswith(p) for p in FORCE_URC_PREFIXES)
+        if is_forced_urc and any(text.startswith(p) for p in FORCE_URC_FOLLOWUP_PREFIXES):
+            self._force_next_urc_line = True
+
         if self._pending and not is_forced_urc:
             self._resp_lines.append(text)
             if TERMINAL_RE.match(text):

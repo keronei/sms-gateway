@@ -1,69 +1,76 @@
 """
-sms.py - text-mode SMS operations on top of an already-open ATChannel.
+sms.py - PDU-mode SMS operations on top of an already-open ATChannel.
 
-Deliberately uses AT text mode (AT+CMGF=1) rather than PDU mode: it covers
-list/read/delete/send without needing a GSM-7/UCS2/UDH codec, which is the
-right tradeoff for the inbox + simple-reply use case. Sending long
-(multi-segment) or delivery-report-tracked messages for bulk campaign
-dispatch is expected to move to PDU mode in a later milestone - that's a
-separate concern from this module.
+Uses AT+CMGF=0 (PDU mode) rather than text mode: this is what enables
+multi-segment (concatenated) sending and delivery-report (+CDS)
+correlation, neither of which text mode supports. AT+CMGF is a session-
+wide setting, so mixing text-mode reading with PDU-mode sending isn't
+practical - everything (list/read/delete/send) goes through PDU mode here.
 
 Knows nothing about the database - manager.py is responsible for persisting
-what these functions return.
+what these functions return. The external shape of list_messages()'s
+results is unchanged from the old text-mode version (sim_index, status,
+sender, raw_timestamp, received_at, body), so callers didn't need to change.
 """
 import re
 import csv
 import io
-import time
-import calendar
 
-from modem.serial_at import ATError, ATTimeout
+from modem import pdu
 from modem import text_codec
 
 CMGS_REF_RE = re.compile(r'^\+CMGS:\s*(\d+)$')
-TIMESTAMP_RE = re.compile(r"^\d{2}/\d{2}/\d{2},\d{2}:\d{2}:\d{2}[+-]\d{1,2}$")
+CMGL_PDU_HEADER_RE_FIELDS = 4  # <index>,<stat>,<alpha>,<length>
 
 
 def configure(channel, timeout=10):
-    """Text mode + store-on-SIM-and-notify. Call once after the control
-    channel is (re)opened."""
-    channel.send("AT+CMGF=1", timeout=timeout)
-    channel.send("AT+CNMI=2,1,0,0,0", timeout=timeout)
+    """PDU mode + store-on-SIM-and-notify for new messages, with direct
+    URC delivery for delivery (status) reports (the ds=1 in CNMI)."""
+    channel.send("AT+CMGF=0", timeout=timeout)
+    channel.send("AT+CNMI=2,1,0,1,0", timeout=timeout)
 
 
 def list_messages(channel, timeout=15):
     """Returns a list of dicts: {sim_index, status, sender, raw_timestamp,
     received_at (epoch float or None), body}."""
-    resp = channel.send('AT+CMGL="ALL"', timeout=timeout)
-    return _parse_cmgl(resp.lines)
+    resp = channel.send("AT+CMGL=4", timeout=timeout)  # 4 = ALL messages, PDU mode
+    return _parse_cmgl_pdu(resp.lines)
 
 
 def delete_message(channel, sim_index, timeout=10):
     channel.send(f"AT+CMGD={sim_index}", timeout=timeout)
 
 
-def send_text(channel, phone, text, prompt_timeout=10, send_timeout=30):
-    """Sends a single text-mode SMS. Returns the message reference number
-    (int) if the modem reports one, else None. Raises ATError/ATTimeout."""
-    channel.send_expect_prompt(f'AT+CMGS="{phone}"', timeout=prompt_timeout)
-    resp = channel.send_payload(text, ctrl_z=True, timeout=send_timeout)
-    for line in resp.lines:
-        m = CMGS_REF_RE.match(line.strip())
-        if m:
-            return int(m.group(1))
-    return None
+def send_message(channel, phone, text, reference=0, request_status_report=True,
+                  prompt_timeout=10, send_timeout=30):
+    """Sends `text` as one or more SMS-SUBMIT PDUs, auto-segmenting into
+    multiple parts if needed. Returns a list of (part_seq, part_total, mr)
+    tuples, one per segment actually sent - mr is the message reference the
+    modem reports for that segment, used to correlate a later +CDS:
+    delivery report (matched against (mr, recipient))."""
+    parts = pdu.encode_submit_pdu(phone, text, reference=reference,
+                                   request_status_report=request_status_report)
+    total = len(parts)
+    results = []
+    for seq, (pdu_hex, tpdu_len) in enumerate(parts, start=1):
+        channel.send_expect_prompt(f"AT+CMGS={tpdu_len}", timeout=prompt_timeout)
+        resp = channel.send_payload(pdu_hex, ctrl_z=True, timeout=send_timeout)
+        mr = None
+        for line in resp.lines:
+            m = CMGS_REF_RE.match(line.strip())
+            if m:
+                mr = int(m.group(1))
+                break
+        results.append((seq, total, mr))
+    return results
 
 
 # ------------------------------------------------------------------ parsing
-def _parse_cmgl_header(line):
-    """+CMGL: <index>,<stat>,<oa>,[<alpha>],<scts>  - <alpha> is normally
-    omitted (giving the "...,," most examples show) but some carriers
-    populate it with a sender name alongside a shortcode/number, which the
-    previous rigid regex here didn't account for and would silently mis-
-    parse. Using csv.reader to split fields properly handles both: it
-    respects quoting (so the timestamp's internal comma doesn't split it
-    into two fields) and naturally gives an empty string for omitted
-    fields (",,") without needing a fixed field count."""
+def _parse_cmgl_pdu_header(line):
+    """+CMGL: <index>,<stat>,[<alpha>],<length> - <alpha> is normally empty
+    but, as with text mode, some carriers/phonebook matches can populate it,
+    so this uses the same csv-based field splitting as the old text-mode
+    parser rather than a rigid fixed-format regex."""
     if not line.startswith("+CMGL:"):
         return None
     rest = line[len("+CMGL:"):].strip()
@@ -75,78 +82,37 @@ def _parse_cmgl_header(line):
         return None
     try:
         sim_index = int(row[0].strip())
+        stat = int(row[1].strip())
     except ValueError:
         return None
-
-    status = row[1].strip() if len(row) > 1 else ""
-    sender = row[2].strip() if len(row) > 2 else ""
-    alpha = row[3].strip() if len(row) > 3 else ""
-    raw_timestamp = ""
-    for candidate in row[4:] + ([alpha] if alpha else []):
-        if TIMESTAMP_RE.match(candidate.strip()):
-            raw_timestamp = candidate.strip()
-            break
-
-    # if the alpha tag is populated (a friendly sender name alongside a
-    # shortcode/number) and isn't just a duplicate of the sender field,
-    # fold it into a "Name <number>" style display
-    if alpha and alpha != sender and not TIMESTAMP_RE.match(alpha):
-        sender_display = f"{alpha} <{sender}>" if sender else alpha
-    else:
-        sender_display = sender
-
-    return {
-        "sim_index": sim_index,
-        "status": status,
-        "sender": text_codec.decode_possible_hex(sender_display),
-        "raw_timestamp": raw_timestamp,
-    }
+    return {"sim_index": sim_index, "status": str(stat)}
 
 
-def _parse_cmgl(lines):
-    """Header lines (see _parse_cmgl_header) followed by the body line(s)
-    until the next header. Message bodies could in principle contain a line
-    starting with '+CMGL:' themselves, which would confuse this - an
-    accepted, extremely unlikely edge case for a text-mode SMS inbox."""
+def _parse_cmgl_pdu(lines):
+    """Header lines (see _parse_cmgl_pdu_header) followed by exactly one
+    PDU-hex line each. Anything that fails to decode is skipped rather than
+    aborting the whole drain - one malformed entry shouldn't lose the rest
+    of the inbox."""
     records = []
-    current = None
-    body_lines = []
-
-    def _flush():
-        if current is not None:
-            body = "\n".join(body_lines).strip()
-            current["body"] = text_codec.decode_possible_hex(body)
-            current["received_at"] = _parse_timestamp(current["raw_timestamp"])
-            records.append(current)
-
-    for line in lines:
-        header = _parse_cmgl_header(line.strip())
-        if header:
-            _flush()
-            current = header
-            body_lines = []
-        elif current is not None:
-            body_lines.append(line)
-    _flush()
+    i = 0
+    while i < len(lines):
+        header = _parse_cmgl_pdu_header(lines[i].strip())
+        if header and i + 1 < len(lines):
+            pdu_hex = lines[i + 1].strip()
+            try:
+                decoded = pdu.decode_deliver_pdu(pdu_hex)
+            except Exception:
+                i += 2
+                continue
+            records.append({
+                "sim_index": header["sim_index"],
+                "status": header["status"],
+                "sender": text_codec.decode_possible_hex(decoded["sender"]),
+                "raw_timestamp": decoded["raw_timestamp"],
+                "received_at": decoded["received_at"],
+                "body": decoded["text"],
+            })
+            i += 2
+        else:
+            i += 1
     return records
-
-
-def _parse_timestamp(raw):
-    """'yy/MM/dd,hh:mm:ss+zz' where zz is the timezone offset in *quarter
-    hours* from GMT (3GPP TS 27.005). Falls back to None (caller should use
-    time.time() as the received_at) if parsing fails - the raw string is
-    always preserved regardless."""
-    try:
-        m = re.match(r"(\d{2})/(\d{2})/(\d{2}),(\d{2}):(\d{2}):(\d{2})([+-]\d{1,2})", raw or "")
-        if not m:
-            return None
-        yy, MM, dd, hh, mm, ss, tz_quarters = m.groups()
-        year = 2000 + int(yy)
-        tz_minutes = int(tz_quarters) * 15
-        dt = time.struct_time((year, int(MM), int(dd), int(hh), int(mm), int(ss), 0, 0, -1))
-        # the fields are "local to the handset"; treat them as UTC first via
-        # calendar.timegm, then shift by the reported offset to get true UTC.
-        epoch_as_if_utc = calendar.timegm(dt)
-        return epoch_as_if_utc - tz_minutes * 60
-    except (ValueError, TypeError):
-        return None

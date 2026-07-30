@@ -17,7 +17,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import db  # noqa: E402
-from modem import gpio_power, ports, sms, ussd  # noqa: E402
+from modem import gpio_power, ports, sms, ussd, pdu  # noqa: E402
 from modem.backoff import ExponentialBackoff  # noqa: E402
 from modem.serial_at import ATChannel, ATError, ATTimeout  # noqa: E402
 from modem.ppp import PPPSupervisor  # noqa: E402
@@ -46,6 +46,8 @@ class ModemManager:
         self._ppp_config_snapshot = None
         self._current_call_id = None
         self._current_call_last_ring = 0.0
+        self._pending_cds_header = None   # set while awaiting the PDU-hex line after a +CDS: header
+        self._sms_reference_counter = 0   # rotating concat reference for multi-part SMS (0-255)
 
     # ------------------------------------------------------------- utils
     def reload_settings(self):
@@ -196,10 +198,10 @@ class ModemManager:
     def _configure_sms(self, ch, retry_after_settle=False):
         try:
             sms.configure(ch)
-            self.log("info", "sms", "Text mode configured (AT+CMGF=1, AT+CNMI=2,1,0,0,0)")
+            self.log("info", "sms", "PDU mode configured (AT+CMGF=0, AT+CNMI=2,1,0,1,0)")
             return
         except (ATError, ATTimeout) as e:
-            self.log("error", "sms", f"Failed to configure SMS text mode: {e}")
+            self.log("error", "sms", f"Failed to configure SMS PDU mode: {e}")
         if not retry_after_settle:
             return
         # one retry with a longer wait, in case the SIM needed more than the
@@ -207,9 +209,9 @@ class ModemManager:
         self._sleep(2)
         try:
             sms.configure(ch)
-            self.log("info", "sms", "Text mode configured on retry")
+            self.log("info", "sms", "PDU mode configured on retry")
         except (ATError, ATTimeout) as e:
-            self.log("error", "sms", f"SMS text mode retry also failed: {e}")
+            self.log("error", "sms", f"SMS PDU mode retry also failed: {e}")
 
     def _check_and_unlock_sim(self, ch):
         """Checks AT+CPIN? and, if the SIM is locked, attempts to unlock it
@@ -384,6 +386,14 @@ class ModemManager:
         self.log("info", "urc", line)
         if self._ussd_waiter.on_urc_line(line):
             return
+        if self._pending_cds_header is not None:
+            # this line is the PDU-hex payload following a +CDS: <length> header
+            self._handle_delivery_report(line.strip())
+            self._pending_cds_header = None
+            return
+        if line.startswith("+CDS:"):
+            self._pending_cds_header = line.strip()
+            return
         if line.startswith("+CMTI:"):
             # Do NOT call ch.send() here - this callback runs on the reader
             # thread itself, and send() waits on an event that same thread
@@ -393,6 +403,25 @@ class ModemManager:
             self._handle_ring()
         elif line.startswith("+CLIP:"):
             self._handle_clip(line)
+
+    def _handle_delivery_report(self, pdu_hex):
+        try:
+            report = pdu.decode_status_report_pdu(pdu_hex)
+        except Exception as e:
+            self.log("error", "sms", f"Failed to decode delivery report: {e}")
+            return
+        updated = db.update_sms_ref_status(report["mr"], report["recipient"], report["status"])
+        if updated:
+            self.log("info", "sms",
+                     f"Delivery report for {report['recipient']} (mr={report['mr']}): {report['status']}")
+        else:
+            self.log("warn", "sms",
+                     f"Delivery report for unrecognized mr={report['mr']}/{report['recipient']}: {report['status']}")
+
+    def _next_sms_reference(self):
+        ref = self._sms_reference_counter
+        self._sms_reference_counter = (self._sms_reference_counter + 1) % 256
+        return ref
 
     # ---------------------------------------------------------------- calls
     def _handle_ring(self):
@@ -530,9 +559,14 @@ class ModemManager:
             db.complete_modem_command(cmd["id"], "failed", "Phone and text are required")
             return
         try:
-            mr = sms.send_text(ch, phone, text)
-            self.log("info", "sms", f"Sent SMS to {phone} (mr={mr})")
-            db.complete_modem_command(cmd["id"], "done", json.dumps({"message_ref": mr}))
+            reference = self._next_sms_reference()
+            parts = sms.send_message(ch, phone, text, reference=reference, request_status_report=True)
+            for seq, total, mr in parts:
+                if mr is not None:
+                    db.record_sms_ref(mr, phone, part_seq=seq, part_total=total)
+            refs = [mr for _, _, mr in parts]
+            self.log("info", "sms", f"Sent SMS to {phone} in {len(parts)} part(s) (refs={refs})")
+            db.complete_modem_command(cmd["id"], "done", json.dumps({"message_refs": refs, "parts": len(parts)}))
         except (ATError, ATTimeout) as e:
             self.log("error", "sms", f"Failed to send SMS to {phone}: {e}")
             db.complete_modem_command(cmd["id"], "failed", str(e))

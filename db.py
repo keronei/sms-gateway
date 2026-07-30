@@ -185,6 +185,23 @@ def init_db():
                 created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_modem_inbox_created ON modem_inbox(created_at);
+
+            -- Tracks each SMS-SUBMIT PDU segment's message reference (TP-MR)
+            -- against the recipient it was sent to, so an incoming +CDS:
+            -- delivery report (which only gives us mr+recipient - the same
+            -- correlation key the GSM spec itself uses) can be matched back
+            -- to it and the status updated from 'sent' to 'delivered'/'failed'.
+            CREATE TABLE IF NOT EXISTS modem_sms_refs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                mr INTEGER NOT NULL,
+                recipient TEXT NOT NULL,
+                status TEXT DEFAULT 'sent',    -- sent, delivered, failed, pending
+                part_seq INTEGER DEFAULT 1,
+                part_total INTEGER DEFAULT 1,
+                sent_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_modem_sms_refs_lookup ON modem_sms_refs(mr, recipient);
             """
         )
         conn.execute(
@@ -522,3 +539,34 @@ def delete_call_log_entry(call_id):
 def clear_call_log():
     with get_conn() as conn:
         conn.execute("DELETE FROM modem_calls")
+
+
+# ------------------------------------------------------- SMS delivery tracking
+def record_sms_ref(mr, recipient, part_seq=1, part_total=1):
+    now = time.time()
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO modem_sms_refs (mr, recipient, status, part_seq, part_total, sent_at, updated_at)
+               VALUES (?, ?, 'sent', ?, ?, ?, ?)""",
+            (mr, recipient, part_seq, part_total, now, now),
+        )
+
+
+def update_sms_ref_status(mr, recipient, status):
+    """Matches an incoming delivery report back to a sent SMS by (mr,
+    recipient) - the same correlation key the GSM spec itself uses for
+    SMS-STATUS-REPORTs. Returns True if a matching row was found."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE modem_sms_refs SET status = ?, updated_at = ? WHERE mr = ? AND recipient = ?",
+            (status, time.time(), mr, recipient),
+        )
+        return cur.rowcount > 0
+
+
+def get_recent_sms_refs(limit=100):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM modem_sms_refs ORDER BY sent_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
