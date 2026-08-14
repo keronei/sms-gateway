@@ -18,16 +18,59 @@ import io
 
 from modem import pdu
 from modem import text_codec
+from modem.serial_at import ATError
 
 CMGS_REF_RE = re.compile(r'^\+CMGS:\s*(\d+)$')
 CMGL_PDU_HEADER_RE_FIELDS = 4  # <index>,<stat>,<alpha>,<length>
 
+# AT+CNMI's first parameter (<mode>, notification routing mode) - per the
+# Huawei MU509 AT Command Interface Spec section 6.3.3, mode=2 ("report
+# notification and state report to the TE directly... reserved, not
+# supported currently") is NOT actually supported on this module, despite
+# AT+CNMI=? advertising it as a valid value. That's almost certainly what
+# was behind the original "+CMS ERROR: 303" on ds=1 - not something wrong
+# with ds itself. mode=1 is the module's own documented example for this
+# exact use case (store incoming via +CMTI, direct delivery reports via
+# +CDS): "AT+CNMI=1,1,0,1,0" (spec section 6.3.4).
+CNMI_MODE = 1
 
-def configure(channel, timeout=10):
-    """PDU mode + store-on-SIM-and-notify for new messages, with direct
-    URC delivery for delivery (status) reports (the ds=1 in CNMI)."""
+# AT+CNMI fourth parameter (ds - delivery report reporting mode), tried in
+# this order. ds=1 (direct +CDS delivery, paired with CNMI_MODE=1 above)
+# is what the module's own documented example uses and should simply
+# work; ds=0 (no delivery reports at all) is the last-resort fallback if
+# ds=1 is still rejected for some other reason - it costs real
+# functionality (sent messages can never transition to delivered/failed),
+# so it's only used when ds=1 fails.
+#
+# Deliberately NOT including ds=2 here: per the same spec (sections 6.3.3,
+# 6.4.3, 6.6.2), "SR" (status report) storage is "reserved, not supported
+# currently" on this module. ds=2 would make +CDSI fire, but there is no
+# way to ever read the report back - it's simply lost. That's worse than
+# ds=0 (silent instead of visibly absent), so it's excluded from the
+# default probe order. It's still usable via an explicit ds_order if a
+# future firmware revision turns out to support it.
+CNMI_DS_FALLBACK = (1, 0)
+
+
+def configure(channel, timeout=10, ds_order=CNMI_DS_FALLBACK):
+    """PDU mode + store-on-SIM-and-notify for new messages. Probes
+    ds_order in turn for the delivery-report (status report) reporting
+    mode and keeps the first one the module actually accepts.
+
+    Returns the ds value that succeeded (an int from ds_order).
+    Raises the last ATError/ATTimeout if every value in ds_order is
+    rejected (AT+CMGF failing is always fatal and raised immediately,
+    before any ds is attempted)."""
     channel.send("AT+CMGF=0", timeout=timeout)
-    channel.send("AT+CNMI=2,1,0,1,0", timeout=timeout)
+    last_err = None
+    for ds in ds_order:
+        try:
+            channel.send(f"AT+CNMI={CNMI_MODE},1,0,{ds},0", timeout=timeout)
+            return ds
+        except ATError as e:
+            last_err = e
+            continue
+    raise last_err
 
 
 def list_messages(channel, timeout=15):

@@ -48,6 +48,7 @@ class ModemManager:
         self._current_call_last_ring = 0.0
         self._pending_cds_header = None   # set while awaiting the PDU-hex line after a +CDS: header
         self._sms_reference_counter = 0   # rotating concat reference for multi-part SMS (0-255)
+        self._cnmi_ds = None              # which AT+CNMI ds value the module actually accepted (see sms.configure)
 
     # ------------------------------------------------------------- utils
     def reload_settings(self):
@@ -197,21 +198,42 @@ class ModemManager:
 
     def _configure_sms(self, ch, retry_after_settle=False):
         try:
-            sms.configure(ch)
-            self.log("info", "sms", "PDU mode configured (AT+CMGF=0, AT+CNMI=2,1,0,1,0)")
+            self._cnmi_ds = sms.configure(ch)
+            self._log_cnmi_ds("PDU mode configured")
             return
         except (ATError, ATTimeout) as e:
-            self.log("error", "sms", f"Failed to configure SMS PDU mode: {e}")
+            self._cnmi_ds = None
+            self.log("error", "sms", f"Failed to configure SMS PDU mode (all CNMI ds values rejected): {e}")
         if not retry_after_settle:
             return
         # one retry with a longer wait, in case the SIM needed more than the
         # initial settle window
         self._sleep(2)
         try:
-            sms.configure(ch)
-            self.log("info", "sms", "PDU mode configured on retry")
+            self._cnmi_ds = sms.configure(ch)
+            self._log_cnmi_ds("PDU mode configured on retry")
         except (ATError, ATTimeout) as e:
+            self._cnmi_ds = None
             self.log("error", "sms", f"SMS PDU mode retry also failed: {e}")
+
+    def _log_cnmi_ds(self, prefix):
+        ds = self._cnmi_ds
+        if ds == 1:
+            self.log("info", "sms", f"{prefix} (AT+CMGF=0, AT+CNMI=1,1,0,1,0 - direct delivery reports)")
+        elif ds == 2:
+            self.log("warn", "sms",
+                     f"{prefix} (AT+CMGF=0, AT+CNMI=1,1,0,2,0 - ds=1 was rejected, falling back to "
+                     "store+notify via +CDSI). Per the MU509 AT command spec, \"SR\" storage isn't "
+                     "supported on this module, so those +CDSI notifications can never actually be "
+                     "read back - delivery status will silently never update. Treat this the same as "
+                     "ds=0 in practice. Sending/receiving SMS itself is unaffected.")
+        elif ds == 0:
+            self.log("warn", "sms",
+                     f"{prefix} (AT+CMGF=0, AT+CNMI=1,1,0,0,0 - ds=1 was rejected by the module). "
+                     "Delivery reports are OFF: sent messages will stay 'sent' and never move to "
+                     "'delivered'/'failed'. Sending/receiving SMS itself is unaffected.")
+        else:
+            self.log("info", "sms", f"{prefix} (ds={ds})")
 
     def _check_and_unlock_sim(self, ch):
         """Checks AT+CPIN? and, if the SIM is locked, attempts to unlock it
