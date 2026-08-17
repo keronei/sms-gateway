@@ -75,7 +75,10 @@ def configure(channel, timeout=10, ds_order=CNMI_DS_FALLBACK):
 
 def list_messages(channel, timeout=15):
     """Returns a list of dicts: {sim_index, status, sender, raw_timestamp,
-    received_at (epoch float or None), body}."""
+    received_at (epoch float or None), body, concat_ref, concat_total,
+    concat_seq}. The last three are None for a normal (non-concatenated)
+    message; manager.py uses them to reassemble multi-part messages
+    across the parts CMGL returns as separate entries."""
     resp = channel.send("AT+CMGL=4", timeout=timeout)  # 4 = ALL messages, PDU mode
     return _parse_cmgl_pdu(resp.lines)
 
@@ -154,6 +157,9 @@ def _parse_cmgl_pdu(lines):
                 "raw_timestamp": decoded["raw_timestamp"],
                 "received_at": decoded["received_at"],
                 "body": decoded["text"],
+                "concat_ref": decoded.get("concat_ref"),
+                "concat_total": decoded.get("concat_total"),
+                "concat_seq": decoded.get("concat_seq"),
             })
             i += 2
         else:

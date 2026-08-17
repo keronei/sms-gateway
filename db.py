@@ -65,7 +65,12 @@ def init_db():
                 modem_ppp_password TEXT DEFAULT '',
                 modem_sim_pin TEXT DEFAULT '',
                 modem_gpio_power_pin INTEGER DEFAULT 17,
-                modem_auto_connect INTEGER DEFAULT 1
+                -- default OFF: the daemon should never dial out on its own the first
+                -- time it starts. It only flips to 1 when the user explicitly asks -
+                -- via the dashboard's "Reconnect internet now" button, ticking this
+                -- setting on in Settings -> Modem, or texting "connect" to the SIM -
+                -- and stays 1 (auto-redialing on drops) until turned off again.
+                modem_auto_connect INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS templates (
@@ -570,3 +575,31 @@ def get_recent_sms_refs(limit=100):
             "SELECT * FROM modem_sms_refs ORDER BY sent_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_sms_ref_statuses(mrs, recipient, since=None):
+    """Looks up the current status of specific (mr, recipient) pairs -
+    used by dispatcher.py's modem-backend delivery-report refresh. `mrs`
+    is the list of TP-MR values recorded for one recipient's send (one
+    per segment, for a multi-part message). `since` (epoch, optional)
+    guards against an 8-bit mr value (0-255) having been reused by an
+    unrelated earlier send to the same phone number - only rows recorded
+    at or after that time are considered a match. Returns a list of
+    status strings, one per matching row found (not necessarily the same
+    length as `mrs` if a ref hasn't been recorded yet)."""
+    if not mrs:
+        return []
+    with get_conn() as conn:
+        placeholders = ",".join("?" for _ in mrs)
+        query = f"SELECT mr, status, sent_at FROM modem_sms_refs WHERE recipient = ? AND mr IN ({placeholders})"
+        params = [recipient, *mrs]
+        if since is not None:
+            query += " AND sent_at >= ?"
+            params.append(since - 10)  # small buffer for clock/round-trip slack between processes
+        rows = conn.execute(query, params).fetchall()
+        # one row per (mr, recipient) is the expected case (idx_modem_sms_refs_lookup
+        # is exactly that key) - if duplicates ever exist, latest sent_at wins
+        by_mr = {}
+        for r in sorted(rows, key=lambda r: r["sent_at"]):
+            by_mr[r["mr"]] = r["status"]
+        return list(by_mr.values())

@@ -27,10 +27,14 @@ NETWORK_INFO_INTERVAL = 60  # seconds between signal/registration refreshes
 POWER_ON_SETTLE = 12        # seconds to let the module boot/enumerate USB after a power pulse
 COMMAND_POLL_INTERVAL = 1.5  # seconds between checks of modem_commands
 INBOX_FALLBACK_POLL = 20    # seconds between inbox drains even without a +CMTI URC
+CONCAT_STALE_SECONDS = 300  # how long to hold an incomplete multi-part SMS waiting
+                             # for its missing part(s) before delivering what we have
 CALL_GAP_SECONDS = 10        # RING/+CLIP within this long of the last one = same call
 SIM_SETTLE_SECONDS = 2        # wait after a PIN unlock before touching SMS/USSD/CLIP
 HEALTH_CHECK_RETRIES = 3      # ping attempts before declaring the control port dead
 HEALTH_CHECK_RETRY_GAP = 3    # seconds between those retries
+CONNECT_SMS_KEYWORD = "connect"  # inbound SMS body (case-insensitive, trimmed) that
+                                  # authorizes + kicks off a PPP connection attempt
 
 
 class ModemManager:
@@ -49,6 +53,11 @@ class ModemManager:
         self._pending_cds_header = None   # set while awaiting the PDU-hex line after a +CDS: header
         self._sms_reference_counter = 0   # rotating concat reference for multi-part SMS (0-255)
         self._cnmi_ds = None              # which AT+CNMI ds value the module actually accepted (see sms.configure)
+        # Multi-part (concatenated) incoming SMS reassembly buffer.
+        # Keyed by (sender, concat_ref, concat_total). Value:
+        #   {"parts": {seq: record}, "sim_indexes": {seq: sim_index}, "first_seen": epoch float}
+        # Only ever touched from the inbox-poll thread, so no lock needed.
+        self._concat_buffer = {}
 
     # ------------------------------------------------------------- utils
     def reload_settings(self):
@@ -286,10 +295,34 @@ class ModemManager:
         data_port, baud, apn, username, password = self._ppp_config()
         self.ppp = PPPSupervisor(
             data_port=data_port, baud=baud, apn=apn, username=username, password=password,
-            auto_connect=lambda: bool(self.reload_settings_get("modem_auto_connect", 1)),
+            auto_connect=lambda: bool(self.reload_settings_get("modem_auto_connect", 0)),
         )
         self._ppp_config_snapshot = (data_port, baud, apn, username, password)
         self.ppp.start()
+
+    def _authorize_and_reconnect_ppp(self):
+        """The one place that turns internet access ON. Shared by the
+        dashboard's "Reconnect internet now" button and an inbound SMS
+        saying "connect" - both persist modem_auto_connect=1 (so the PPP
+        supervisor's own dial gate opens and stays open across future
+        control-channel drops or a manager restart, until turned off
+        again in Settings) and then kick an immediate connection attempt.
+
+        Deliberately does NOT get called anywhere in the normal startup/
+        reconnect path in run() - the daemon coming up, or the modem
+        power-cycling and the control channel being re-established, must
+        never by itself start dialing out."""
+        db.save_settings({"modem_auto_connect": 1})
+        self.reload_settings()
+        if self.ppp and self._ppp_config() != self._ppp_config_snapshot:
+            self.log("info", "ppp", "PPP settings changed; rebuilding supervisor before reconnecting")
+            self.ppp.stop()
+            self.ppp = None
+            self._ensure_ppp_supervisor()
+        elif self.ppp:
+            self.ppp.request_reconnect()
+        else:
+            self._ensure_ppp_supervisor()
 
     def reload_settings_get(self, key, default=None):
         # cheap fresh read so toggling "auto connect" in Settings takes effect
@@ -492,24 +525,137 @@ class ModemManager:
                 continue  # was just the fallback timer firing with nothing to do
 
     def _drain_inbox(self, ch):
+        """Copies any SIM-resident messages into the DB inbox.
+
+        A message that's one part of a concatenated (multi-part) SMS is
+        buffered instead of delivered immediately - see
+        _buffer_concat_part(). Its SIM slot is deliberately NOT deleted
+        yet, so it will keep showing up in AT+CMGL on every subsequent
+        drain until the whole set is either complete or times out;
+        _buffer_concat_part() is written to be a no-op the second+ time it
+        sees the same part for exactly that reason.
+
+        Runs on every wake of _inbox_poll_loop (URC or fallback timer)
+        regardless of whether AT+CMGL actually returned anything, because
+        _flush_stale_concat_sets() needs a regular heartbeat independent
+        of new mail arriving.
+        """
         try:
             records = sms.list_messages(ch)
         except (ATError, ATTimeout) as e:
             self.log("error", "sms", f"AT+CMGL failed: {e}")
             return
-        if not records:
-            return
         for rec in records:
-            received_at = rec["received_at"] if rec["received_at"] is not None else time.time()
-            db.add_modem_inbox_message(
-                sender=rec["sender"], body=rec["body"], raw_timestamp=rec["raw_timestamp"],
-                received_at=received_at, sim_index=rec["sim_index"],
-            )
-            self.log("info", "sms", f"New message from {rec['sender']} copied to inbox (SIM slot {rec['sim_index']})")
+            if rec.get("concat_ref") is None:
+                self._deliver_single_message(ch, rec)
+            else:
+                self._buffer_concat_part(ch, rec)
+        self._flush_completed_concat_sets(ch)
+        self._flush_stale_concat_sets(ch)
+
+    def _deliver_single_message(self, ch, rec):
+        """A normal, non-concatenated message: copy to the DB inbox and
+        clear its SIM slot immediately, same as before multi-part support
+        existed."""
+        received_at = rec["received_at"] if rec["received_at"] is not None else time.time()
+        db.add_modem_inbox_message(
+            sender=rec["sender"], body=rec["body"], raw_timestamp=rec["raw_timestamp"],
+            received_at=received_at, sim_index=rec["sim_index"],
+        )
+        self.log("info", "sms", f"New message from {rec['sender']} copied to inbox (SIM slot {rec['sim_index']})")
+        self._maybe_handle_connect_sms(rec["sender"], rec["body"])
+        try:
+            sms.delete_message(ch, rec["sim_index"])
+        except (ATError, ATTimeout) as e:
+            self.log("error", "sms", f"Failed to clear SIM slot {rec['sim_index']} after copying: {e}")
+
+    def _maybe_handle_connect_sms(self, sender, body):
+        """If an inbound message's body is exactly (trimmed, case-
+        insensitive) "connect", treat it the same as pressing the
+        dashboard's "Reconnect internet now" button. A reassembled
+        multi-part message that's missing pieces will have a bracketed
+        "[incomplete message ...]" prefix, which naturally fails this
+        exact-match check - it won't accidentally trigger a connect."""
+        if (body or "").strip().lower() != CONNECT_SMS_KEYWORD:
+            return
+        self.log("info", "ppp", f"Internet connect requested via SMS from {sender}")
+        self._authorize_and_reconnect_ppp()
+
+    def _buffer_concat_part(self, ch, rec):
+        seq, total = rec["concat_seq"], rec["concat_total"]
+        if not (isinstance(seq, int) and isinstance(total, int) and total >= 1 and 1 <= seq <= total):
+            # malformed/hostile UDH (e.g. seq > total) - don't let it sit in
+            # the buffer forever waiting for a part count that makes no
+            # sense; just deliver it standalone the way a non-concat
+            # message would be handled.
+            self.log("warn", "sms",
+                     f"Message from {rec['sender']} had an invalid concat header "
+                     f"(seq={seq}, total={total}) - delivering as a standalone message")
+            self._deliver_single_message(ch, rec)
+            return
+        key = (rec["sender"], rec["concat_ref"], total)
+        entry = self._concat_buffer.setdefault(
+            key, {"parts": {}, "sim_indexes": {}, "first_seen": time.time()}
+        )
+        if seq in entry["parts"]:
+            return  # already buffered this exact part on an earlier drain - not deleted yet, so it's re-listed each poll
+        entry["parts"][seq] = rec
+        entry["sim_indexes"][seq] = rec["sim_index"]
+
+    def _flush_completed_concat_sets(self, ch):
+        complete = [key for key in self._concat_buffer if len(self._concat_buffer[key]["parts"]) >= key[2]]
+        for key in complete:
+            entry = self._concat_buffer.pop(key)
+            self._deliver_concat_set(ch, key, entry, timed_out=False)
+
+    def _flush_stale_concat_sets(self, ch):
+        now = time.time()
+        stale = [key for key, entry in self._concat_buffer.items()
+                 if now - entry["first_seen"] > CONCAT_STALE_SECONDS]
+        for key in stale:
+            entry = self._concat_buffer.pop(key)
+            self._deliver_concat_set(ch, key, entry, timed_out=True)
+
+    def _deliver_concat_set(self, ch, key, entry, timed_out):
+        sender, concat_ref, total = key
+        parts = entry["parts"]
+        missing = [seq for seq in range(1, total + 1) if seq not in parts]
+
+        body_chunks = [parts[seq]["body"] if seq in parts else f"[missing part {seq}/{total}]"
+                       for seq in range(1, total + 1)]
+        body = "".join(body_chunks)
+        if missing:
+            body = f"[incomplete message - missing part(s) {', '.join(map(str, missing))} of {total}] " + body
+
+        anchor = parts.get(1) or min(
+            parts.values(),
+            key=lambda r: r["received_at"] if r["received_at"] is not None else float("inf"),
+        )
+        received_at = anchor["received_at"] if anchor["received_at"] is not None else time.time()
+
+        db.add_modem_inbox_message(
+            sender=sender, body=body, raw_timestamp=anchor["raw_timestamp"],
+            received_at=received_at, sim_index=None,
+        )
+
+        if missing:
+            self.log("warn", "sms",
+                     f"Multi-part message from {sender} (ref={concat_ref}) "
+                     f"{'timed out after ' + str(CONCAT_STALE_SECONDS) + 's ' if timed_out else ''}"
+                     f"delivered incomplete: {len(parts)}/{total} part(s) received, "
+                     f"missing {missing}")
+        else:
+            self.log("info", "sms",
+                     f"Multi-part message from {sender} (ref={concat_ref}) reassembled "
+                     f"from {total} part(s)")
+        self._maybe_handle_connect_sms(sender, body)
+
+        for seq, sim_index in entry["sim_indexes"].items():
             try:
-                sms.delete_message(ch, rec["sim_index"])
+                sms.delete_message(ch, sim_index)
             except (ATError, ATTimeout) as e:
-                self.log("error", "sms", f"Failed to clear SIM slot {rec['sim_index']} after copying: {e}")
+                self.log("error", "sms",
+                         f"Failed to clear SIM slot {sim_index} after reassembling multi-part message: {e}")
 
     # --------------------------------------------------------- commands
     def _command_poll_loop(self):
@@ -547,16 +693,7 @@ class ModemManager:
                 db.complete_modem_command(cmd["id"], "done", "Power pulse sent")
             elif name == "reconnect_ppp":
                 self.log("info", "ppp", "Manual reconnect requested from dashboard")
-                self.reload_settings()
-                if self.ppp and self._ppp_config() != self._ppp_config_snapshot:
-                    self.log("info", "ppp", "PPP settings changed; rebuilding supervisor before reconnecting")
-                    self.ppp.stop()
-                    self.ppp = None
-                    self._ensure_ppp_supervisor()
-                elif self.ppp:
-                    self.ppp.request_reconnect()
-                else:
-                    self._ensure_ppp_supervisor()
+                self._authorize_and_reconnect_ppp()
                 db.complete_modem_command(cmd["id"], "done", "Reconnect triggered")
             elif name == "send_sms":
                 self._handle_send_sms(cmd)

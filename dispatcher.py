@@ -1,11 +1,19 @@
 """
 dispatcher.py - runs a campaign's sends in a background thread with
 configurable delay/batching, and supports pause/stop from the UI.
+
+Which backend actually sends (Android Gateway vs the Huawei modem) is
+settings["sms_backend"], toggled from the dashboard's Settings tab -
+gateway.py and modem_gateway.py present the same send_message()/
+GatewayError shape so the worker loop below doesn't need to know which
+one it's using beyond picking the module once per run.
 """
+import json
 import threading
 import time
 import db
 import gateway
+import modem_gateway
 
 # campaign_id -> {"thread": Thread, "control": "run"|"pause"|"stop"}
 _JOBS = {}
@@ -53,11 +61,17 @@ def is_running(campaign_id):
         return bool(job and job["thread"].is_alive())
 
 
+def _backend_module(settings):
+    return modem_gateway if settings.get("sms_backend") == "modem" else gateway
+
+
 def _worker(campaign_id, only_ids=None):
     settings = db.get_settings()
     delay = float(settings.get("delay_seconds") or 0)
     batch_size = int(settings.get("batch_size") or 0)
     batch_pause = float(settings.get("batch_pause_seconds") or 0)
+    backend = _backend_module(settings)
+    is_modem = backend is modem_gateway
 
     recipients = db.get_recipients(campaign_id)
     if only_ids is not None:
@@ -80,18 +94,28 @@ def _worker(campaign_id, only_ids=None):
 
         db.update_recipient(r["id"], status="sending")
         try:
-            resp = gateway.send_message(settings, [r["phone_normalized"]], r["filled_message"])
-            msg_id = resp.get("id") if isinstance(resp, dict) else None
+            resp = backend.send_message(settings, [r["phone_normalized"]], r["filled_message"])
             gw_state = resp.get("state") if isinstance(resp, dict) else None
             status = "failed" if gw_state == "Failed" else "sent"
+            if is_modem:
+                # reusing gateway_message_id to hold the modem's TP-MR
+                # value(s) (one per segment) as a JSON list, since that's
+                # the correlation key refresh_statuses() needs to look up
+                # delivery reports in modem_sms_refs - there's no single
+                # opaque message id like the Android gateway has.
+                tracking_id = json.dumps(resp.get("message_refs", [])) if isinstance(resp, dict) else None
+                fail_reason = "Modem reported a send failure"
+            else:
+                tracking_id = resp.get("id") if isinstance(resp, dict) else None
+                fail_reason = "Gateway reported failure"
             db.update_recipient(
                 r["id"],
                 status=status,
-                gateway_message_id=msg_id,
+                gateway_message_id=tracking_id,
                 sent_at=time.time(),
-                error=None if status == "sent" else "Gateway reported failure",
+                error=None if status == "sent" else fail_reason,
             )
-        except gateway.GatewayError as e:
+        except (gateway.GatewayError, modem_gateway.GatewayError) as e:
             db.update_recipient(r["id"], status="failed", error=str(e))
 
         sent_in_batch += 1
@@ -132,15 +156,26 @@ def start_campaign(campaign_id, only_ids=None):
 
 
 def refresh_statuses(campaign_id):
-    """Poll the gateway for delivery state of already-sent messages.
-    'sent' means submitted to the gateway; 'delivered' means the carrier/gateway
-    confirmed delivery; anything still in flight (Pending/Processed/etc.) is left
-    as 'sent' rather than being guessed at."""
+    """Poll for delivery state of already-sent messages. 'sent' means
+    submitted; 'delivered' means the carrier/gateway confirmed delivery;
+    anything still in flight is left as 'sent' rather than being guessed
+    at. Which backend to poll is settings["sms_backend"] at call time -
+    note this can differ from whatever backend a given recipient was
+    actually *sent* through if the setting was changed mid-campaign; a
+    recipient sent via the other backend simply won't have a
+    gateway_message_id this backend's lookup recognizes, so it's safely
+    skipped rather than mismatched."""
     settings = db.get_settings()
     recipients = [
         r for r in db.get_recipients(campaign_id)
         if r["status"] in ("sent", "delivered") and r["gateway_message_id"]
     ]
+    if settings.get("sms_backend") == "modem":
+        return _refresh_modem_statuses(recipients)
+    return _refresh_gateway_statuses(settings, recipients)
+
+
+def _refresh_gateway_statuses(settings, recipients):
     updated = 0
     for r in recipients:
         try:
@@ -154,4 +189,27 @@ def refresh_statuses(campaign_id):
         elif state == "Failed" and r["status"] != "failed":
             db.update_recipient(r["id"], status="failed", error="Delivery failed")
             updated += 1
+    return updated
+
+
+def _refresh_modem_statuses(recipients):
+    updated = 0
+    for r in recipients:
+        try:
+            mrs = json.loads(r["gateway_message_id"])
+        except (TypeError, ValueError):
+            continue  # not a modem-tracked recipient (e.g. sent via the other backend)
+        if not mrs:
+            continue
+        statuses = db.get_sms_ref_statuses(mrs, r["phone_normalized"], since=r["sent_at"])
+        if len(statuses) < len(mrs):
+            continue  # still waiting on a +CDS report for at least one segment
+        if any(s == "failed" for s in statuses):
+            if r["status"] != "failed":
+                db.update_recipient(r["id"], status="failed", error="Delivery failed")
+                updated += 1
+        elif all(s == "delivered" for s in statuses):
+            if r["status"] != "delivered":
+                db.update_recipient(r["id"], status="delivered", error=None)
+                updated += 1
     return updated

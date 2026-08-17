@@ -9,6 +9,7 @@ from flask import Flask, request, jsonify, render_template, send_file, abort
 import db
 import merge
 import gateway
+import modem_gateway
 import dispatcher
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,12 +68,16 @@ def api_save_settings():
     return jsonify(saved)
 
 
+def _backend_module(settings):
+    return modem_gateway if settings.get("sms_backend") == "modem" else gateway
+
+
 @app.route("/api/settings/test", methods=["POST"])
 def api_test_settings():
     body = request.get_json(force=True) or {}
     settings = db.get_settings()
     settings.update({k: v for k, v in body.items() if v not in (None, "")})
-    result = gateway.test_connection(settings)
+    result = _backend_module(settings).test_connection(settings)
     return jsonify(result)
 
 
@@ -87,10 +92,11 @@ def api_test_send():
     normalized, valid = merge.normalize_phone(phone, settings.get("default_country_code", ""))
     if not valid:
         return jsonify({"ok": False, "message": f"'{phone}' does not look like a valid phone number."}), 400
+    backend = _backend_module(settings)
     try:
-        resp = gateway.send_message(settings, [normalized], text)
+        resp = backend.send_message(settings, [normalized], text)
         return jsonify({"ok": True, "response": resp})
-    except gateway.GatewayError as e:
+    except (gateway.GatewayError, modem_gateway.GatewayError) as e:
         return jsonify({"ok": False, "message": str(e)}), 502
 
 

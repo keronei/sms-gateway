@@ -14,28 +14,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modem.manager import ModemManager
 from tests.fake_modem import cnmi_channel
-
-
-class CapturingLogger:
-    def __init__(self):
-        self.entries = []  # list of (level, category, message)
-
-    def __call__(self, level, category, message):
-        self.entries.append((level, category, message))
-
-    def messages(self):
-        return [m for _, _, m in self.entries]
-
-    def levels(self):
-        return [lvl for lvl, _, _ in self.entries]
-
-
-def make_manager():
-    mgr = ModemManager()
-    mgr.log = CapturingLogger()
-    return mgr
+from tests.manager_test_utils import CapturingLogger, make_manager
 
 
 class TestConfigureSmsDsWiring(unittest.TestCase):

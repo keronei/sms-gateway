@@ -10,12 +10,15 @@ with PDU-mode sending isn't practical without fragile mode-toggling across
 the several threads that share one control channel.
 
 Known scope limits:
-  - incoming concatenated (multi-part) messages are decoded individually,
-    per part - full reassembly of multi-part *incoming* messages isn't
-    implemented (a much rarer case for this dashboard's reminder/reply use
-    case than outbound multi-segment sending, which *is* fully supported)
   - the SMSC address is always encoded as length 0, letting the module use
     its own configured/default SMSC rather than us specifying one
+
+Incoming concatenated (multi-part) messages: decode_deliver_pdu() below
+decodes each part individually (it has no visibility across AT+CMGL
+entries to reassemble anything) - part-buffering, ordering, and merging
+into one combined inbox entry is done by manager.py's
+_buffer_concat_part()/_deliver_concat_set(), using the concat_ref/
+concat_total/concat_seq fields this module extracts from each part's UDH.
 """
 from modem.text_codec import GSM7_DEFAULT_ALPHABET
 
@@ -348,8 +351,9 @@ def _encode_single_submit(recipient, text, use_gsm7, udh, request_status_report)
 def decode_deliver_pdu(pdu_hex):
     """Decodes an incoming SMS-DELIVER PDU. Returns a dict: sender,
     received_at (epoch or None), raw_timestamp, text, and (if the message
-    is one part of a concatenated set) concat_ref/concat_total/concat_seq -
-    reassembly across parts isn't performed (see module docstring)."""
+    is one part of a concatenated set) concat_ref/concat_total/concat_seq.
+    Reassembly across parts is manager.py's job (see module docstring) -
+    this function only ever sees one PDU at a time."""
     data = bytes.fromhex(pdu_hex)
     pos = 0
 

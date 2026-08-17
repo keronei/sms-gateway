@@ -99,6 +99,10 @@ async function loadSettings() {
   $("#s_batch").value = s.batch_size ?? 20;
   $("#s_batchpause").value = s.batch_pause_seconds ?? 15;
 
+  const backend = s.sms_backend === "modem" ? "modem" : "android_gateway";
+  $("#b_android").checked = backend === "android_gateway";
+  $("#b_modem").checked = backend === "modem";
+
   $("#m_control_port").value = s.modem_control_port || "/dev/ttyUSB0";
   $("#m_data_port").value = s.modem_data_port || "/dev/ttyUSB1";
   $("#m_apn").value = s.modem_apn || "";
@@ -108,7 +112,11 @@ async function loadSettings() {
   $("#m_sim_pin").placeholder = s.modem_sim_pin_set ? "•••••••• (unchanged)" : "optional";
   $("#m_auto_connect").checked = s.modem_auto_connect === undefined ? true : !!s.modem_auto_connect;
 
-  if (s.address) testConnection(true);
+  if (s.address || backend === "modem") testConnection(true);
+}
+
+function selectedBackend() {
+  return $("#b_modem").checked ? "modem" : "android_gateway";
 }
 
 function gatherConnFields() {
@@ -121,8 +129,17 @@ function gatherConnFields() {
     sim_number: $("#s_sim").value ? parseInt($("#s_sim").value, 10) : null,
     use_https: $("#s_https").checked,
     with_delivery_report: $("#s_dlr").checked,
+    sms_backend: selectedBackend(),  // included so "Test connection" reflects an unsaved radio change too
   };
 }
+
+$("#btnSaveBackend").addEventListener("click", async () => {
+  try {
+    await api("/api/settings", { method: "POST", body: JSON.stringify({ sms_backend: selectedBackend() }) });
+    showMsg($("#backendMsg"), true, `Now dispatching via ${selectedBackend() === "modem" ? "the Huawei modem" : "Android Gateway"}.`);
+    testConnection(true);
+  } catch (e) { showMsg($("#backendMsg"), false, e.message); }
+});
 
 $("#btnSaveSettings").addEventListener("click", async () => {
   try {

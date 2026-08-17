@@ -16,7 +16,7 @@
     </div>
     <div class="conn-status" id="connStatus">
       <span class="conn-dot" id="connDot"></span>
-      <span id="connText">Gateway not checked</span>
+      <span id="connText">Backend not checked</span>
     </div>
   </div>
 
@@ -32,6 +32,29 @@
   <section class="tab-panel active" id="tab-settings">
     <div class="two-col">
       <div>
+        <div class="card">
+          <h2>SMS dispatch backend</h2>
+          <p class="card-sub">Which channel actually sends outbound SMS — for campaigns, the test-send box, and the "Reply" action in the modem Inbox. Delivery-report tracking works either way.</p>
+          <div class="radio-option">
+            <input type="radio" name="sms_backend" id="b_android" value="android_gateway">
+            <label for="b_android">
+              <span class="radio-title">Android Gateway</span>
+              <span class="radio-sub">A phone running the SMS Gateway app, reached over the network (settings below).</span>
+            </label>
+          </div>
+          <div class="radio-option">
+            <input type="radio" name="sms_backend" id="b_modem" value="modem">
+            <label for="b_modem">
+              <span class="radio-title">Huawei modem</span>
+              <span class="radio-sub">This Pi's attached MU509, via the modem-manager daemon. See the Modem tab for live status.</span>
+            </label>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btnSaveBackend">Save backend</button>
+          </div>
+          <div class="status-msg" id="backendMsg"></div>
+        </div>
+
         <div class="card">
           <h2>SMS Gateway connection</h2>
           <p class="card-sub">Address of the phone running the SMS Gateway app's Local Server (LAN IP or Tailscale hostname/IP).</p>
@@ -100,7 +123,7 @@
 
         <div class="card">
           <h2>Modem (Huawei MU509)</h2>
-          <p class="card-sub">Ports and dial settings used by the separate modem-manager daemon for internet (PPP) and, eventually, SMS. See the Modem tab for live status.</p>
+          <p class="card-sub">Ports and dial settings used by the separate modem-manager daemon for internet (PPP) and SMS. See the Modem tab for live status.</p>
           <div class="grid-2">
             <div class="field">
               <label>AT control port</label>

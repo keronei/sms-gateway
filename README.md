@@ -1,14 +1,17 @@
 # Dispatch — SMS Mail Merge Console
 
-A small self-hosted dashboard for personalizing and bulk-sending SMS through an
-[android-sms-gateway](https://github.com/capcom6/android-sms-gateway) device (fee
-reminders, notices, etc.), with CSV mail merge, a review step before sending, and
-live delivery status.
+A small self-hosted dashboard for personalizing and bulk-sending SMS, with CSV
+mail merge, a review step before sending, and live delivery status. Sending
+can go through either an
+[android-sms-gateway](https://github.com/capcom6/android-sms-gateway) device
+or a directly-attached Huawei modem — see "SMS dispatch backend" below.
 
 ## How it works
 
-1. **Settings** — point the dashboard at your Android phone's SMS Gateway Local
-   Server (its LAN IP or a Tailscale address), plus port/username/password.
+1. **Settings** — choose the dispatch backend (Android Gateway or Huawei
+   modem), then configure it: for the gateway, your Android phone's SMS
+   Gateway Local Server address/port/credentials; for the modem, its ports
+   and dial settings (see the Modem section further down).
 2. **Compose** — write a template with `{fields}`, upload a CSV, map each field to
    a CSV column, and preview every merged message before anything is sent.
 3. **Review & Dispatch** — create a campaign from the preview, then start
@@ -106,13 +109,47 @@ lets you dispatch from anywhere, not just your home LAN.
   Settings → Messages screen) — the dashboard's delay/batch settings work
   alongside those, not instead of them.
 
-## Modem (Huawei MU509) — cellular backup internet + future SMS routing
+## SMS dispatch backend
 
-This is being built in slices. **This slice covers: bringing the modem up
-reliably on boot, keeping its internet (PPP) connection alive with automatic
-retry, and giving you visibility into both over the dashboard.** SMS-via-modem,
-USSD, and the async-event/inbox UI land in later milestones — the
-architecture below is already built to accommodate them without rework.
+Settings has an **SMS dispatch backend** picker (Android Gateway / Huawei
+modem) that decides which of the two actually sends campaign messages, the
+test-send box, and `/api/test-send` — not just internally; it's the toggle
+between `gateway.py` (Android) and `modem_gateway.py` (this modem), which
+present the same `send_message()`/`test_connection()` shape so the rest of
+the app (`dispatcher.py`, `app.py`) doesn't care which one is active.
+
+A few things behave differently by design between the two:
+- **Sending through the modem is asynchronous under the hood** — the app and
+  the modem daemon are separate processes talking only through the
+  `modem_commands` table (see the Architecture section below), so a modem
+  send blocks the dispatch worker thread polling for up to 45s waiting for
+  the daemon to actually key `AT+CMGS`. This never blocks the dashboard
+  itself (each campaign dispatches on its own background thread), but a
+  stuck/offline daemon will make that recipient time out rather than fail
+  instantly the way an unreachable Android Gateway does.
+- **Delivery-report tracking uses a different correlation key per backend.**
+  The Android Gateway gives one opaque message id per send; the modem gives
+  one TP-MR value per PDU segment (see `modem_sms_refs`). "Refresh delivery
+  status" reads whichever one applies to how a given recipient was actually
+  sent — a recipient sent via the gateway is safely skipped when refreshing
+  under modem settings and vice versa, so switching backends mid-campaign
+  doesn't corrupt older recipients' tracking, it just means only recipients
+  sent after the switch get refreshed until you switch back.
+- **The modem can only dial one recipient per send** (`AT+CMGS` has no batch
+  equivalent) — irrelevant in practice since the dispatcher already sends one
+  recipient at a time either way.
+- The Modem tab's Inbox **Reply** button always sends via the modem
+  regardless of this setting — you're replying on the SIM that received the
+  message, so that's the only backend that makes sense there.
+
+## Modem (Huawei MU509) — cellular backup internet + SMS routing
+
+A **separate daemon** (`modem/manager.py`, run via `run_modem_manager.py`) owns
+the serial ports and the GPIO power pin, brings the modem up reliably on boot,
+handles SMS in PDU mode (send with delivery-report tracking and automatic
+multi-segment splitting; receive with multi-part reassembly), and supervises a
+PPP internet connection on request. Campaign dispatch can send through either
+this modem or the Android gateway - see "SMS dispatch backend" below.
 
 ### Architecture
 
@@ -123,16 +160,27 @@ ever communicate through the shared SQLite database:
 
 - `modem_status` — current state (device present, SIM, signal, PPP state/IP, ...), written by the daemon, read by Flask.
 - `modem_events` — an append-only log (URCs, power-cycles, PPP retries, daemon activity), written by the daemon, read by Flask.
-- `modem_commands` — action requests (power-cycle, reconnect), written by Flask when you click a button, picked up and executed by the daemon within ~1.5s.
+- `modem_commands` — action requests (power-cycle, reconnect, send SMS, send USSD, end USSD session), written by Flask when you click a button, picked up and executed by the daemon within ~1.5s.
+- `modem_inbox` / `modem_sms_refs` — received messages and per-segment delivery-report tracking for sent ones.
 
 Flask's `/api/modem/*` routes only ever read those tables or insert a command
-row — there is no serial or GPIO code anywhere in `app.py`.
+row — there is no serial or GPIO code anywhere in `app.py`. `modem_gateway.py`
+(project root, alongside `gateway.py`) is the one place outside the daemon
+that touches `modem_commands` directly — it's what `dispatcher.py`/`app.py`
+call when the SMS dispatch backend is set to "modem" (see above), enqueuing a
+`send_sms` command and polling `modem_commands` for the daemon's result the
+same way the Reply button's `/api/modem/send` does, just synchronously from
+the caller's point of view.
 
 Inside `modem/`:
-- `serial_at.py` — generic Hayes AT command engine (fully reusable, knows nothing about SMS/PPP specifically).
+- `serial_at.py` / `serial_transport.py` — generic Hayes AT command engine and the underlying serial I/O it runs on (fully reusable, knows nothing about SMS/PPP specifically).
 - `gpio_power.py` — pulses the PWRKEY line through a transistor switch.
 - `ports.py` — one-off "is anything AT-capable on this device file" probe, used by the presence watchdog.
 - `ppp.py` — dials the *data* port into a PPP session via `pppd`+`chat`, supervises it, retries with backoff.
+- `pdu.py` — encodes/decodes the GSM PDU wire format (GSM7/UCS2, concatenation UDH) — no AT or I/O knowledge, pure codec.
+- `sms.py` — the AT-command side of SMS: `AT+CNMI` configuration (with the mode/ds fallback described below), `AT+CMGS`/`AT+CMGL`/`AT+CMGR`/`AT+CMGD`, built on top of `pdu.py`.
+- `text_codec.py` — shared hex/7-bit text decoding helpers used by both SMS and USSD reply parsing.
+- `ussd.py` — `AT^USSDMODE`/`AT+CUSD` session handling.
 - `backoff.py` — the exponential-backoff-with-jitter helper shared by the power-on watchdog and the PPP supervisor.
 - `manager.py` — orchestrates all of the above as one state machine.
 
@@ -206,8 +254,11 @@ A sane bring-up order to minimize risk:
 2. Run it once in the foreground so you can watch it directly:
    `venv/bin/python3 run_modem_manager.py`
 3. Confirm in the output (or `tail -f` the dashboard, once you can reach it
-   locally) that the device is detected, AT init succeeds, and PPP connects
-   with an IP.
+   locally) that the device is detected and AT init succeeds. At this point
+   PPP will deliberately **not** connect yet — see Auto-connect above; that's
+   expected, not a fault. Authorize it now, either by ticking Settings →
+   Modem → Auto-connect and saving, or by texting `connect` to the SIM from
+   another phone, then confirm PPP comes up with an IP.
 4. Confirm Tailscale actually comes up and you can reach the Pi over it from
    another device.
 5. Only then `sudo systemctl enable --now modem-manager` for it to survive
@@ -234,7 +285,25 @@ device files, since dialing puts that port into PPP framing mode.
 - **PPP username/password** — leave blank unless your carrier requires PAP/CHAP auth for the APN.
 - **SIM PIN** — only if the SIM is PIN-locked.
 - **GPIO power pin** — must match your wiring.
-- **Auto-connect** — toggles whether the daemon dials PPP automatically; turn this off if you want the modem powered/AT-ready but not consuming data.
+- **Auto-connect** — whether the daemon dials PPP on its own. **Defaults to
+  off**: the daemon never dials out just because it started, or because the
+  modem power-cycled and the control channel came back up — only because you
+  explicitly asked it to, via one of:
+  - ticking this checkbox on and saving Settings,
+  - clicking **Reconnect internet now** on the Modem tab, or
+  - texting **`connect`** (exact text, case-insensitive) to the SIM from any
+    phone.
+
+  Any of those three flips this setting to **on** and stays on (auto-redialing
+  through drops) until you turn it off again — it's the same persisted value
+  either way, not a one-off action. Turn it off if you want the modem
+  powered/AT-ready but not consuming data.
+
+  Upgrading from an older install: this setting used to default to **on**.
+  That default only applies to a brand-new `data/dashboard.db` — if you
+  already have one, its stored value is still `1` regardless of this change,
+  so untick it once in Settings → Modem if you want the new "off until asked"
+  behavior.
 
 ### Modem tab
 
@@ -242,27 +311,46 @@ Shows live status (device presence, AT readiness, SIM status, signal
 quality, registration/operator, PPP state + IP, retry countdown), a live log
 of daemon activity and raw unsolicited events, and two manual controls:
 "Power-cycle modem" (forces a PWRKEY pulse) and "Reconnect internet now"
-(resets backoff and redials immediately). Both just insert a row into
+(authorizes + redials immediately, resetting backoff — see Auto-connect
+above for what "authorizes" means). Both just insert a row into
 `modem_commands` — the daemon picks it up within ~1.5s.
 
-### SMS inbox (read / reply / delete)
+### SMS (send / receive) — PDU mode
 
-Runs in AT **text mode** (`AT+CMGF=1`, `AT+CNMI=2,1,0,0,0`) — no PDU codec
-needed for this slice. New messages trigger a `+CMTI` unsolicited code; the
-daemon reads everything via `AT+CMGL="ALL"`, copies each message into the
-`modem_inbox` table, and immediately deletes it off the SIM (`AT+CMGD`) since
-SIM storage is tiny (~40 messages) and the DB is now the durable copy. There's
-also a 20-second fallback sweep in case a `+CMTI` gets missed.
+Runs in AT **PDU mode** (`AT+CMGF=0`), not text mode — this is what makes
+delivery reports and correct UCS2/multi-segment handling possible, neither of
+which text mode supports. `AT+CNMI` is set to `1,1,0,<ds>,0`: mode=1 and
+ds=1 are the module's own documented values for "store incoming and notify
+via `+CMTI`, report delivery status directly via `+CDS`" (see
+`modem/sms.py`'s module docstring for why mode=2 doesn't work on this
+module despite `AT+CNMI=?` advertising it, and why `ds=2` is skipped
+entirely — the module's `"SR"` status-report storage isn't supported, so
+that mode would silently lose every delivery report).
+
+**Receiving:** a `+CMTI` URC (or a 20-second fallback sweep) triggers
+`AT+CMGL=4` to pull everything off the SIM. A normal single-part message is
+copied into `modem_inbox` and deleted off the SIM immediately (SIM storage is
+tiny — ~40 messages — and the DB is the durable copy). A message that's one
+part of a **concatenated (multi-part) SMS** is held back instead: its SIM
+slot is deliberately *not* deleted until every part of the set has arrived,
+at which point they're merged in order into a single `modem_inbox` row and
+all their SIM slots are cleared together. If a part never shows up, the set
+is delivered anyway after 5 minutes with `[missing part N/M]` markers spliced
+in, rather than holding the SIM slot forever.
+
+**Sending:** `AT+CMGS` in PDU mode, with automatic splitting into multiple
+segments for long messages and delivery-report tracking end to end
+(`modem_sms_refs` records each segment's message reference and status,
+updated as `+CDS` reports arrive).
 
 The Modem tab's **Inbox** card lists messages with **Reply** (opens a quick
 compose box, sends via the same `send_sms` primitive the future
 campaign-dispatch-via-modem integration will reuse) and **Delete** (removes
 the DB copy — the SIM copy is already gone by the time you see it here).
 
-Note: sending is text-mode only in this slice (single segment, no delivery
-report tracking yet) — fine for replies and short messages; multi-segment/
-delivery-tracked sending for bulk campaigns is planned for the PDU-mode
-milestone.
+**Texting `connect`** to the SIM from any phone brings up the internet
+connection the same way clicking **Reconnect internet now** does — see
+Auto-connect above.
 
 ### USSD
 
@@ -295,6 +383,10 @@ deadlock), so not worth more machinery for now.
 - **`device_present` stays 0 and GPIO keeps pulsing** — check wiring/common
   ground, and confirm the control port setting matches the port that
   actually answers `AT` (see "Verifying which ttyUSB is which" above).
+- **PPP state just stays `down` and nothing happens, no error shown** — this
+  is expected, not a fault: Auto-connect defaults to off, so the daemon
+  won't dial on its own. Tick it on in Settings → Modem, click "Reconnect
+  internet now", or text `connect` to the SIM. See Auto-connect above.
 - **PPP keeps failing / `ppp_last_error` shows a pppd exit code** — check
   the APN is correct, `pppd`/`chat` are installed (`which pppd chat`), and
   that the daemon's user is in the `dialout`/`dip` groups.
