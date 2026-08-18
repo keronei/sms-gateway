@@ -180,10 +180,19 @@ class ATChannel:
         Caller must follow up with send_payload()."""
         with self._cmd_lock:
             self._prepare(command)
-            self._write(command + "\r")
-            if not self._prompt_event.wait(timeout):
+            try:
+                self._write(command + "\r")
+                if not self._prompt_event.wait(timeout):
+                    raise ATTimeout(f"Timed out waiting for '>' prompt after {command!r}")
+            except Exception:
+                # only reset _pending on a failure path - the success path
+                # deliberately leaves it True (see below) until send_payload;
+                # without this, a write failure here (device disconnected,
+                # etc.) would leave _pending stuck True forever, and every
+                # subsequent URC would be wrongly swallowed as if it
+                # belonged to a command response that will never arrive.
                 self._pending = False
-                raise ATTimeout(f"Timed out waiting for '>' prompt after {command!r}")
+                raise
             # deliberately leave _pending True / lock held conceptually until send_payload;
             # caller is expected to call send_payload next.
 
@@ -197,8 +206,7 @@ class ATChannel:
                 data = payload if isinstance(payload, bytes) else payload.encode()
                 if ctrl_z:
                     data += b"\x1a"
-                self._ser.write(data)
-                self._ser.flush()
+                self._write_raw(data)
                 if not self._resp_event.wait(timeout):
                     raise ATTimeout("Timed out waiting for response after payload")
                 return self._finalize()
@@ -233,5 +241,17 @@ class ATChannel:
         return AtResponse(ok=True, lines=info_lines, raw="\n".join(self._resp_lines))
 
     def _write(self, text):
-        self._ser.write(text.encode())
-        self._ser.flush()
+        self._write_raw(text.encode())
+
+    def _write_raw(self, data):
+        """Every actual write to the port funnels through here, so a
+        physical disconnect (raw OSError from the transport layer) is
+        translated into ATError exactly once, in one place - every
+        existing `except (ATError, ATTimeout)` call site throughout the
+        rest of this codebase automatically becomes resilient to it,
+        rather than needing to also catch a bare OSError individually."""
+        try:
+            self._ser.write(data)
+            self._ser.flush()
+        except OSError as e:
+            raise ATError(f"Serial write failed - device may have disconnected: {e}") from e

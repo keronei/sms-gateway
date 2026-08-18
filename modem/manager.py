@@ -303,26 +303,30 @@ class ModemManager:
     def _authorize_and_reconnect_ppp(self):
         """The one place that turns internet access ON. Shared by the
         dashboard's "Reconnect internet now" button and an inbound SMS
-        saying "connect" - both persist modem_auto_connect=1 (so the PPP
-        supervisor's own dial gate opens and stays open across future
-        control-channel drops or a manager restart, until turned off
-        again in Settings) and then kick an immediate connection attempt.
+        saying "connect". Persists modem_auto_connect=1 (a secondary gate
+        PPPSupervisor also checks - see its _supervise_loop()) and then
+        explicitly authorizes + kicks the supervisor via
+        request_reconnect(), which is the ONLY thing that actually opens
+        its dial gate - see PPPSupervisor.request_reconnect()'s docstring.
 
-        Deliberately does NOT get called anywhere in the normal startup/
-        reconnect path in run() - the daemon coming up, or the modem
-        power-cycling and the control channel being re-established, must
-        never by itself start dialing out."""
+        That authorization is deliberately NOT persisted anywhere: a fresh
+        supervisor (built on every daemon start, or rebuilt here if
+        settings changed) always begins unauthorized/disconnected, and a
+        connection that later drops on its own also returns to
+        unauthorized rather than auto-redialing forever - either way, a
+        fresh call to THIS function is what's required to (re)connect.
+        Never called anywhere in the normal startup/reconnect path in
+        run() for exactly that reason - the daemon coming up, or the
+        modem power-cycling and the control channel being re-established,
+        must never by itself start dialing out."""
         db.save_settings({"modem_auto_connect": 1})
         self.reload_settings()
         if self.ppp and self._ppp_config() != self._ppp_config_snapshot:
             self.log("info", "ppp", "PPP settings changed; rebuilding supervisor before reconnecting")
             self.ppp.stop()
             self.ppp = None
-            self._ensure_ppp_supervisor()
-        elif self.ppp:
-            self.ppp.request_reconnect()
-        else:
-            self._ensure_ppp_supervisor()
+        self._ensure_ppp_supervisor()
+        self.ppp.request_reconnect()
 
     def reload_settings_get(self, key, default=None):
         # cheap fresh read so toggling "auto connect" in Settings takes effect
@@ -740,6 +744,7 @@ class ModemManager:
         if not text:
             db.complete_modem_command(cmd["id"], "failed", "USSD text is required")
             return
+        self._ussd_waiter.reset()  # must happen before send() - see UssdWaiter.wait_for_reply()'s docstring
         try:
             ussd.send(ch, text)
         except (ATError, ATTimeout) as e:

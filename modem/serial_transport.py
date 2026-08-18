@@ -81,8 +81,14 @@ class HuaweiSerial:
 
     def close(self):
         if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+            fd, self.fd = self.fd, None
+            try:
+                os.close(fd)
+            except OSError:
+                # already gone (e.g. the device disappeared before we got
+                # here) - nothing more we can do, and self.fd is already
+                # cleared above either way
+                pass
 
     @property
     def is_open(self):
@@ -95,25 +101,75 @@ class HuaweiSerial:
     def __exit__(self, *a):
         self.close()
 
+    def _mark_dead(self):
+        """The device physically went away mid-operation (USB unplugged,
+        a power blip, the kernel dropping the node, ...) - os.write()/
+        os.read()/select() surface this as a plain OSError, commonly
+        ENXIO/EIO/ENODEV. Close out our side immediately so is_open
+        reflects reality right away rather than leaving a stale fd that
+        would make every subsequent call fail in confusing, inconsistent
+        ways (or, for a fd number that's since been reused by an
+        unrelated file, silently write/read the wrong thing)."""
+        self.close()
+
     def write(self, data):
         with self.lock:
+            if self.fd is None:
+                raise OSError(f"Serial port {self.port} is not open")
             if isinstance(data, str):
                 data = data.encode()
             if self.debug:
                 print("TX>", data)
-            os.write(self.fd, data)
+            try:
+                os.write(self.fd, data)
+            except OSError as e:
+                self._mark_dead()
+                raise OSError(
+                    f"Write to {self.port} failed, port is now closed "
+                    f"(device may have disconnected): {e}"
+                ) from e
 
     def flush(self):
         pass  # no userspace write buffering here - os.write() goes straight to the kernel
 
     def read(self, size=1024):
-        r, _, _ = select.select([self.fd], [], [], self.timeout)
+        if self.fd is None:
+            return b""  # not open (never opened, or already marked dead) -
+                         # treat like "nothing available" rather than raising,
+                         # since callers poll this in a tight loop and a
+                         # closed port is an expected, not exceptional, state
+        try:
+            r, _, _ = select.select([self.fd], [], [], self.timeout)
+        except OSError as e:
+            self._mark_dead()
+            raise OSError(
+                f"select() on {self.port} failed, port is now closed "
+                f"(device may have disconnected): {e}"
+            ) from e
         if not r:
             return b""
         try:
             d = os.read(self.fd, size)
         except BlockingIOError:
             return b""  # possible with O_NONBLOCK in a narrow race right after select()
+        except OSError as e:
+            self._mark_dead()
+            raise OSError(
+                f"Read from {self.port} failed, port is now closed "
+                f"(device may have disconnected): {e}"
+            ) from e
+        if not d:
+            # select() said the fd was readable, but os.read() came back
+            # empty anyway - per POSIX that specifically means EOF (the
+            # peer/device is gone for good), NOT "nothing to report this
+            # iteration" (that's the `if not r` timeout branch above,
+            # already handled). Without this check, a disconnected port
+            # that reaches this state would busy-loop forever: select()
+            # keeps reporting "ready", read() keeps returning nothing, and
+            # nothing ever raises to let _read_loop's except-and-break
+            # notice the port is dead.
+            self._mark_dead()
+            raise OSError(f"{self.port} reached EOF (device disconnected)")
         if self.debug:
             print("RX>", d)
         return d

@@ -17,8 +17,11 @@ network just knows which session it belongs to. AT+CUSD=2 ends a session.
 1 = further action required (network expects a reply), 2 = terminated by
 network, 4 = operation not supported, 5 = network timeout.
 
-Real device output is messier than the spec suggests, in two ways this
+Real device output is messier than the spec suggests, in three ways this
 module has to tolerate:
+  - <str> and <dcs> are themselves optional per 3GPP TS 27.007 - a bare
+    "+CUSD: 0" (or "+CUSD: 2") with no quoted text at all is a valid, fairly
+    common reply (e.g. a plain session-end acknowledgement with no message)
   - the quoted <str> can itself contain literal embedded newlines (e.g. a
     multi-item bundle menu), which arrives as several physical lines even
     though it's logically one response
@@ -26,11 +29,14 @@ module has to tolerate:
     actually raw packed 7-bit GSM septet garbage - a coincidental byte
     value, not a real quote), which breaks strict quote-matching
 
-Both are handled by buffering: once a line starts a "+CUSD:" response, keep
-appending subsequent lines until there's a brief pause in arrival (real
-multi-line responses arrive in a fast burst), then parse the whole buffered
-block with a loose regex that takes "first quote to last quote" as the text
-rather than stopping at the first embedded quote.
+The latter two are handled by buffering: once a line starts a "+CUSD:"
+response, keep appending subsequent lines until there's a brief pause in
+arrival (real multi-line responses arrive in a fast burst), then parse the
+whole buffered block with a loose regex that takes "first quote to last
+quote" as the text rather than stopping at the first embedded quote. The
+first (no quoted text at all) is handled by making that whole part of the
+regex optional, so a bare reply resolves immediately rather than being
+mistaken for the start of a multi-line response that never completes.
 """
 import re
 import time
@@ -40,8 +46,16 @@ from modem import text_codec
 
 # Loose on purpose: DOTALL so '.' matches embedded newlines, and a greedy
 # match up to the LAST quote (not the first) so a stray '"' byte inside
-# garbled/packed content doesn't truncate the text early.
-CUSD_RE = re.compile(r'^\+CUSD:\s*(\d)\s*,\s*"(.*)"\s*(?:,\s*(\d+))?\s*$', re.DOTALL)
+# garbled/packed content doesn't truncate the text early. The whole
+# ,"<str>"[,<dcs>] portion is optional - 3GPP TS 27.007 defines <str> and
+# <dcs> as optional parameters, and real networks commonly send a bare
+# "+CUSD: 0" (or "+CUSD: 2") with no text at all for a plain session-end
+# acknowledgement. Without this, a bare reply like that wouldn't match at
+# all, and would fall through to on_urc_line's multi-line-buffering path
+# waiting (uselessly, since nothing more is coming) for BUFFER_SETTLE_SECONDS,
+# then to _finish()'s last-resort fallback, which used to display the raw
+# "+CUSD: 0" AT line itself as if it were the message text.
+CUSD_RE = re.compile(r'^\+CUSD:\s*(\d)\s*(?:,\s*"(.*)"\s*(?:,\s*(\d+))?)?\s*$', re.DOTALL)
 CUSD_START_RE = re.compile(r'^\+CUSD:')
 
 BUFFER_SETTLE_SECONDS = 0.5   # safety-net gap if nothing ever cleanly matches
@@ -151,8 +165,29 @@ class UssdWaiter:
         }
         self._event.set()
 
-    def wait_for_reply(self, timeout=30):
+    def reset(self):
+        """Clears any previous reply/event state. The caller (manager.py's
+        _handle_send_ussd) MUST call this immediately before sending a new
+        USSD request, not after - see wait_for_reply()'s docstring for why
+        the clear can't safely live there."""
+        with self._lock:
+            self._clear_buffer_locked()
+        self._result = None
         self._event.clear()
+
+    def wait_for_reply(self, timeout=30):
+        """Deliberately does NOT clear self._event here. AT+CUSD's own OK
+        only confirms the request was accepted - the actual network reply
+        can arrive (on the serial reader thread, via on_urc_line()) at any
+        point after that, including in the brief window between ussd.send()
+        returning and this function being called (e.g. while a log line is
+        being written). If this function cleared the event itself, a reply
+        that raced in during that window would be silently discarded -
+        self._result would already hold the correct reply, but the caller
+        would still block for the full timeout waiting for an event that
+        will never come again, since the real reply was already consumed
+        and won't be resent. Resetting must happen once, up front, right
+        before the request is sent - see reset()."""
         if self._event.wait(timeout):
             return self._result
         return None

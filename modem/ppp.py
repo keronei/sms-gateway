@@ -62,6 +62,8 @@ class PPPSupervisor:
 
         self._stop = threading.Event()
         self._reconnect_now = threading.Event()
+        self._authorized = False  # only True after an explicit request_reconnect() -
+                                   # see _supervise_loop()'s top-of-loop check and comments
         self._thread = None
         self._proc = None
         self._backoff = ExponentialBackoff(base=5, factor=2, max_delay=300)
@@ -84,7 +86,15 @@ class PPPSupervisor:
         return bool(self._thread and self._thread.is_alive())
 
     def request_reconnect(self):
-        """Force an immediate reconnect attempt, resetting the backoff counter."""
+        """Force an immediate reconnect attempt, resetting the backoff
+        counter. This is the ONLY thing that opens _authorized - see
+        _supervise_loop(): a connection is only ever (re-)established
+        because of an explicit call here, never merely because a
+        persisted "auto-connect" setting happens to be on. That means a
+        freshly (re)started supervisor - a daemon restart, or a rebuild
+        after settings changed - always begins "disconnected until asked",
+        even if modem_auto_connect was left on 1 from a previous run."""
+        self._authorized = True
         self._backoff.reset()
         self._kill_pppd()
         self._reconnect_now.set()
@@ -93,7 +103,7 @@ class PPPSupervisor:
     def _supervise_loop(self):
         self._log("info", "PPP supervisor starting")
         while not self._stop.is_set():
-            if not self.auto_connect():
+            if not self._authorized or not self.auto_connect():
                 db.update_modem_status(ppp_state="down")
                 self._wait(5)
                 continue
@@ -109,11 +119,39 @@ class PPPSupervisor:
                     ppp_retry_count=0, ppp_connected_since=time.time(), ppp_next_retry_at=None,
                 )
                 self._log("info", f"Connected, IP={ip}")
+                # consume whatever request led to THIS dial attempt now,
+                # before monitoring begins - otherwise a leftover
+                # request_reconnect() signal from starting this very
+                # connection would still read as "set" the moment we drop,
+                # and every first drop would be wrongly read as a fresh
+                # request arriving mid-connection (see
+                # test_ppp_supervisor.py for the regression this guards).
+                self._reconnect_now.clear()
                 self._monitor_until_dropped()
                 if self._stop.is_set():
                     break
-                self._log("warn", "PPP link dropped")
+                # _reconnect_now still being set (nothing clears it between
+                # _monitor_until_dropped() returning and here - only _wait()
+                # does that) tells us WHY monitoring stopped: a deliberate
+                # request_reconnect() call interrupting an active connection
+                # (e.g. settings changed underneath it), vs. the link
+                # actually dying on its own.
+                reconnect_was_requested = self._reconnect_now.is_set()
+                self._reconnect_now.clear()  # must clear before looping back, or the
+                                              # NEW connection's _monitor_until_dropped()
+                                              # would see it still set and exit immediately
                 db.update_modem_status(ppp_state="down", ppp_ip=None)
+                if reconnect_was_requested:
+                    self._log("info", "Reconnect requested while connected - redialing")
+                    continue  # skip backoff, redial immediately below
+                # the connection dropped on its own (bundle ran out, signal
+                # lost, carrier hiccup, ...). That fulfils the original
+                # request; deliberately do NOT keep auto-redialing forever -
+                # require a fresh explicit request before trying again.
+                self._authorized = False
+                self._log("warn", "PPP link dropped - waiting for an explicit reconnect request "
+                                   "before trying again")
+                continue
             else:
                 self._kill_pppd()
 

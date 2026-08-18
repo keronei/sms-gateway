@@ -173,7 +173,7 @@ same way the Reply button's `/api/modem/send` does, just synchronously from
 the caller's point of view.
 
 Inside `modem/`:
-- `serial_at.py` / `serial_transport.py` — generic Hayes AT command engine and the underlying serial I/O it runs on (fully reusable, knows nothing about SMS/PPP specifically).
+- `serial_at.py` / `serial_transport.py` — generic Hayes AT command engine and the underlying serial I/O it runs on (fully reusable, knows nothing about SMS/PPP specifically). A physical disconnect mid-operation (USB dropping out momentarily, a power blip) is handled, not fatal: a raw OS-level I/O failure is caught right at the transport layer, the port is immediately marked closed so `is_open` reflects reality without delay, and it surfaces up through the same `ATError`/`ATTimeout` exceptions every caller already handles — so a mid-write hiccup fails that one command fast and cleanly (the existing device-presence watchdog in `manager.py`'s `run()` loop takes it from there and reopens the port once the device comes back) rather than taking down the whole daemon process.
 - `gpio_power.py` — pulses the PWRKEY line through a transistor switch.
 - `ports.py` — one-off "is anything AT-capable on this device file" probe, used by the presence watchdog.
 - `ppp.py` — dials the *data* port into a PPP session via `pppd`+`chat`, supervises it, retries with backoff.
@@ -256,9 +256,10 @@ A sane bring-up order to minimize risk:
 3. Confirm in the output (or `tail -f` the dashboard, once you can reach it
    locally) that the device is detected and AT init succeeds. At this point
    PPP will deliberately **not** connect yet — see Auto-connect above; that's
-   expected, not a fault. Authorize it now, either by ticking Settings →
-   Modem → Auto-connect and saving, or by texting `connect` to the SIM from
-   another phone, then confirm PPP comes up with an IP.
+   expected, not a fault. Authorize it now, either by clicking **Reconnect
+   internet now** on the Modem tab (if you can already reach the dashboard
+   locally) or by texting `connect` to the SIM from another phone, then
+   confirm PPP comes up with an IP.
 4. Confirm Tailscale actually comes up and you can reach the Pi over it from
    another device.
 5. Only then `sudo systemctl enable --now modem-manager` for it to survive
@@ -285,19 +286,39 @@ device files, since dialing puts that port into PPP framing mode.
 - **PPP username/password** — leave blank unless your carrier requires PAP/CHAP auth for the APN.
 - **SIM PIN** — only if the SIM is PIN-locked.
 - **GPIO power pin** — must match your wiring.
-- **Auto-connect** — whether the daemon dials PPP on its own. **Defaults to
-  off**: the daemon never dials out just because it started, or because the
-  modem power-cycled and the control channel came back up — only because you
-  explicitly asked it to, via one of:
-  - ticking this checkbox on and saving Settings,
+- **Auto-connect** — a secondary gate PPP must also pass to dial (see below);
+  **defaults to off**. The daemon never dials out just because it started, or
+  because the modem power-cycled and the control channel came back up, or
+  because a connection that was up simply dropped on its own — only because
+  you explicitly asked it to, via one of:
   - clicking **Reconnect internet now** on the Modem tab, or
   - texting **`connect`** (exact text, case-insensitive) to the SIM from any
     phone.
 
-  Any of those three flips this setting to **on** and stays on (auto-redialing
-  through drops) until you turn it off again — it's the same persisted value
-  either way, not a one-off action. Turn it off if you want the modem
-  powered/AT-ready but not consuming data.
+  Every one of those is a one-off request, not a standing instruction: if the
+  connection later drops on its own (SMS bundle ran out, signal lost, a
+  carrier hiccup), the daemon deliberately does **not** keep auto-redialing
+  forever — it goes back to fully disconnected and waits for you to ask
+  again, the same as on a fresh start. This is why "recharge the bundle,
+  then text `connect` again" is the expected pattern, not something to work
+  around. This only applies once a connection has actually succeeded and
+  then dropped — a request that hasn't connected *yet* (the dial itself
+  failing, e.g. transient signal loss right as you asked) still retries with
+  backoff, since that's resilience toward fulfilling the one outstanding
+  request, not a fresh unrequested connection; you'll see this as the
+  "retry countdown" on the Modem tab. The one case that *does* redial
+  without a fresh ask: if a request arrives while already connected (e.g.
+  clicking Reconnect again because you changed the APN) — that's treated as
+  "keep trying to fulfil this same request", so it redials immediately
+  rather than treating the interruption as a drop.
+
+  Both the button and the SMS trigger also flip this checkbox on and persist
+  it — but ticking the checkbox by itself, without also clicking Reconnect or
+  texting `connect`, does **not** establish a connection on its own; it just
+  ensures the *next* explicit request succeeds (Auto-connect being off is a
+  second, independent reason a request can be refused, alongside not having
+  asked at all). Turn it off if you want the modem powered/AT-ready but
+  never consuming data even when explicitly asked.
 
   Upgrading from an older install: this setting used to default to **on**.
   That default only applies to a brand-new `data/dashboard.db` — if you
@@ -367,7 +388,10 @@ session" button), `2`/`4`/`5` = network-side error/unsupported/timeout.
 Response text decoding is best-effort: `dcs=15` is plain text; UCS2 replies
 (hex-encoded) are detected and decoded, with a sanity check that rejects
 decoding attempts that produce mostly non-printable garbage, falling back to
-showing the raw text rather than guessing wrong.
+showing the raw text rather than guessing wrong. A reply with no text at all
+(a bare `+CUSD: 0`/`+CUSD: 2` — valid per spec, common for a plain session-end
+acknowledgement) is handled explicitly and resolves immediately, rather than
+being mistaken for the start of a multi-line reply that never completes.
 
 Known edge case: manually power-cycling the modem while a USSD (or SMS)
 request is still waiting on a reply closes the serial reader thread that
