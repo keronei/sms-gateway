@@ -28,6 +28,23 @@ def _upload_path(upload_id):
     return os.path.join(UPLOAD_DIR, f"{safe}.csv")
 
 
+# Runs at import time - NOT inside `if __name__ == "__main__":` - so this
+# actually executes under gunicorn too (`gunicorn app:app` imports this
+# module; it never runs the __main__ block). Without this at module
+# level, the documented production deployment (straight to gunicorn, no
+# `python3 app.py` run first) would never create the database and every
+# request would fail. db.init_db() is idempotent, safe to run every time
+# the process starts.
+#
+# IMPORTANT: this process must run as a SINGLE worker (gunicorn -w 1, or
+# plain `python3 app.py`) - see dispatcher.py's module docstring for why
+# multiple worker processes would each try to resume the same interrupted
+# campaign independently and double-send.
+_ensure_dirs()
+db.init_db()
+dispatcher.resume_interrupted_campaigns()
+
+
 # --------------------------------------------------------------------- pages
 @app.route("/")
 def index():
@@ -270,7 +287,8 @@ def api_get_campaign(campaign_id):
 
 @app.route("/api/campaigns/<int:campaign_id>/status", methods=["GET"])
 def api_campaign_status(campaign_id):
-    if not db.get_campaign(campaign_id):
+    campaign = db.get_campaign(campaign_id)
+    if not campaign:
         abort(404)
     recipients = db.get_recipients(campaign_id)
     slim = [
@@ -280,6 +298,8 @@ def api_campaign_status(campaign_id):
         for r in recipients
     ]
     return jsonify({
+        "status": campaign["status"],
+        "last_error": campaign["last_error"],
         "counts": db.campaign_status_counts(campaign_id),
         "job_state": dispatcher.get_job_state(campaign_id),
         "recipients": slim,
@@ -459,7 +479,14 @@ def api_modem_ussd_end():
 
 
 if __name__ == "__main__":
-    _ensure_dirs()
-    db.init_db()
     port = int(os.environ.get("PORT", 5050))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # use_reloader=False: the reloader re-imports this whole module in a
+    # second subprocess on every code change, which would run the
+    # module-level dispatcher.resume_interrupted_campaigns() call above
+    # twice, in two separate processes - the same double-send risk as
+    # running multiple gunicorn workers (see dispatcher.py's docstring),
+    # just triggered by editing a file during local dev instead of by
+    # deployment config. Keeps debug=True's other benefits (interactive
+    # debugger, verbose error pages), just not the auto-restart-on-change
+    # behavior that causes the duplicate import.
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

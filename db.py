@@ -89,6 +89,7 @@ def init_db():
                 mapping_json TEXT,
                 csv_filename TEXT,
                 status TEXT DEFAULT 'draft',   -- draft, ready, dispatching, paused, completed, stopped
+                last_error TEXT,                -- set when auto-paused (e.g. circuit breaker); cleared on (re)start
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -215,6 +216,19 @@ def init_db():
         conn.execute(
             "INSERT OR IGNORE INTO modem_status (id, last_updated) VALUES (1, ?)", (time.time(),)
         )
+        _ensure_column(conn, "campaigns", "last_error", "TEXT")
+
+
+def _ensure_column(conn, table, column, coltype):
+    """Lightweight migration for a column added after CREATE TABLE IF NOT
+    EXISTS was already applied to someone's real database - that clause
+    only affects a table that doesn't exist yet, so an existing install's
+    file needs this to actually pick up a newly added column. Safe to
+    call on every startup: checks PRAGMA table_info first and is a no-op
+    if the column is already there."""
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
 
 
 # ---------------------------------------------------------------- settings
@@ -308,12 +322,23 @@ def add_recipients(campaign_id, recipients):
         )
 
 
-def set_campaign_status(campaign_id, status):
+def set_campaign_status(campaign_id, status, error=None):
+    """error, when given, replaces campaigns.last_error (pass "" or None
+    to clear it - both are falsy so the column ends up NULL either way).
+    Leaving error unset (the default) leaves last_error untouched, so a
+    routine status change (e.g. a manual pause) doesn't wipe out an
+    earlier auto-pause's explanation before the user has seen it."""
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE campaigns SET status = ?, updated_at = ? WHERE id = ?",
-            (status, time.time(), campaign_id),
-        )
+        if error is not None:
+            conn.execute(
+                "UPDATE campaigns SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+                (status, error or None, time.time(), campaign_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE campaigns SET status = ?, updated_at = ? WHERE id = ?",
+                (status, time.time(), campaign_id),
+            )
 
 
 def get_campaign(campaign_id):
@@ -363,6 +388,34 @@ def campaign_status_counts(campaign_id):
             (campaign_id,),
         ).fetchall()
         return {r["status"]: r["n"] for r in rows}
+
+
+def get_interrupted_campaigns():
+    """Campaigns left in 'dispatching' status - the only way that happens
+    is a worker thread was actively sending when the process stopped
+    (crashed, was killed, the host restarted, ...); a campaign the user
+    deliberately paused/stopped has a different status and is correctly
+    left alone. Used at startup to resume dispatch automatically rather
+    than leaving it silently stuck."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM campaigns WHERE status = 'dispatching'").fetchall()
+        return [dict(r) for r in rows]
+
+
+def reset_stuck_sending_recipients():
+    """A recipient stuck at 'sending' means a worker was captured
+    mid-send when the process stopped - we don't know whether that
+    particular message actually went out before the crash. Resetting to
+    'pending' makes it eligible for a retry rather than stuck forever;
+    the tradeoff (a rare possible duplicate send right at the moment of
+    a crash) is accepted in favor of never silently losing a message.
+    Returns the number of rows reset."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE recipients SET status = 'pending', updated_at = ? WHERE status = 'sending'",
+            (time.time(),),
+        )
+        return cur.rowcount
 
 
 def delete_campaign(campaign_id):

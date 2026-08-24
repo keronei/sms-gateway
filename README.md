@@ -16,7 +16,9 @@ or a directly-attached Huawei modem — see "SMS dispatch backend" below.
    a CSV column, and preview every merged message before anything is sent.
 3. **Review & Dispatch** — create a campaign from the preview, then start
    dispatching. Messages send with a configurable delay/batching so the gateway
-   doesn't get flagged for bulk sending. You can pause, resume, or stop mid-run.
+   doesn't get flagged for bulk sending. You can pause, resume, or stop mid-run,
+   and dispatch survives a restart or a backend outage — see "Resuming dispatch
+   after a restart or a failure" below.
 4. **History** — every campaign and its per-recipient outcome is saved locally
    (SQLite) so you can revisit it or export a results CSV.
 
@@ -65,9 +67,14 @@ Data is stored in `data/dashboard.db` (SQLite) — safe to delete to reset every
    source venv/bin/activate
    pip install -r requirements.txt gunicorn
    ```
-3. Run it with a production server instead of Flask's dev server:
+3. Run it with a production server instead of Flask's dev server. **Must be
+   a single worker** (`-w 1`) — campaign dispatch keeps its state (which
+   worker thread is running, pause/resume signals) in that one process's
+   memory and reconstructs progress from the database on startup; more than
+   one worker process would each think they're the only one running a
+   given campaign and could send every message in it twice:
    ```bash
-   venv/bin/gunicorn -w 2 -b 0.0.0.0:5050 app:app
+   venv/bin/gunicorn -w 1 -b 0.0.0.0:5050 app:app
    ```
 4. (Optional) Run it as a systemd service so it survives reboots. Create
    `/etc/systemd/system/dispatch.service`:
@@ -79,12 +86,15 @@ Data is stored in `data/dashboard.db` (SQLite) — safe to delete to reset every
    [Service]
    User=pi
    WorkingDirectory=/home/pi/sms-dashboard
-   ExecStart=/home/pi/sms-dashboard/venv/bin/gunicorn -w 2 -b 0.0.0.0:5050 app:app
+   ExecStart=/home/pi/sms-dashboard/venv/bin/gunicorn -w 1 -b 0.0.0.0:5050 app:app
    Restart=on-failure
 
    [Install]
    WantedBy=multi-user.target
    ```
+   `Restart=on-failure` matters here beyond the usual "survives a crash" —
+   it's also what makes a campaign interrupted mid-dispatch actually resume:
+   see "Resuming dispatch after a restart" below.
    Then:
    ```bash
    sudo systemctl daemon-reload
@@ -108,6 +118,48 @@ lets you dispatch from anywhere, not just your home LAN.
 - The gateway itself may apply its own rate limits/rules (see the app's own
   Settings → Messages screen) — the dashboard's delay/batch settings work
   alongside those, not instead of them.
+
+## Resuming dispatch after a restart or a failure
+
+Dispatch progress is never held only in memory — every recipient's status is
+written to the database as it changes, so a campaign's progress can always be
+reconstructed from there alone.
+
+**If the process stops mid-campaign** (the Pi loses power, the service gets
+restarted, `systemctl restart dispatch`, ...), the campaign is left recorded
+as `dispatching` in the database — a state that only happens while a worker
+is actively running, never as a deliberate end state. On the next startup,
+before the dashboard serves its first request, the app:
+1. Resets any recipient stuck at `sending` back to `pending` — that status
+   means a worker was captured mid-send when the process stopped; we can't
+   know for certain whether that particular message went out before the
+   crash, so it's made retryable rather than left stuck forever. (Trade-off,
+   stated plainly: this can rarely cause a duplicate send for the one message
+   that was in flight at the exact moment of the crash — accepted in favor of
+   never silently losing one.)
+2. Restarts a worker thread for every campaign still marked `dispatching`,
+   which continues from wherever the recipient statuses left off.
+
+This is why **the app must run as a single process** — see the `-w 1` note in
+the deployment steps above. Dispatch state (which worker is running, pause
+signals) lives in that one process's memory; more than one process would each
+independently try to resume the same interrupted campaign and double-send.
+`Restart=on-failure` in the systemd unit is what actually triggers this in
+practice: the service restarting *is* the recovery mechanism, not something
+you need to trigger by hand.
+
+**If the backend itself becomes unavailable mid-campaign** (SMS bundle
+exhausted, gateway unreachable, modem daemon down) — rather than burning
+through the entire remaining recipient list marking everyone `failed` one by
+one, the campaign **auto-pauses after 5 consecutive send failures** and
+leaves the rest untouched (still `pending`, not wrongly marked as failed).
+The campaign detail view shows why it paused. Fix the underlying issue
+(recharge the bundle, bring the gateway back, restart the modem daemon) and
+click **Resume** — it continues from exactly where it stopped, same as any
+other pause. Five in a row is deliberately generous enough that a handful of
+genuinely bad phone numbers clustered together in messy CSV data won't
+false-trigger it, while still catching a dead channel within seconds rather
+than working through a whole recipient list against it.
 
 ## SMS dispatch backend
 

@@ -404,11 +404,11 @@ async function loadCampaign(id) {
   $("#campaignView").style.display = "block";
   $("#dCampaignName").textContent = c.name;
   $("#dCampaignMeta").textContent = `${c.recipients.length} recipient(s) · status: ${c.status}`;
-  renderCampaignBody(c.counts, c.recipients, c.job_state);
+  renderCampaignBody(c.counts, c.recipients, c.job_state, c.status, c.last_error);
   startPolling();
 }
 
-function renderCampaignBody(counts, recipients, jobState) {
+function renderCampaignBody(counts, recipients, jobState, campaignStatus, lastError) {
   const total = recipients.length || 1;
   const order = ["sent", "delivered", "failed", "sending", "queued", "pending", "invalid", "skipped"];
   $("#dSummary").innerHTML = order.filter(s => counts[s]).map(s =>
@@ -419,10 +419,26 @@ function renderCampaignBody(counts, recipients, jobState) {
   const failPct = ((counts.failed || 0) / total) * 100;
   $("#dProgress").innerHTML = `<div class="p-sent" style="width:${successPct}%"></div><div class="p-failed" style="width:${failPct}%"></div>`;
 
+  if (lastError) {
+    $("#dCampaignError").textContent = lastError;
+    $("#dCampaignError").classList.add("show");
+  } else {
+    $("#dCampaignError").classList.remove("show");
+  }
+
   // jobState is only ever "run", "pause", or null/undefined (worker thread finished
   // — whether it completed, was stopped, or errored out — all look the same: idle).
   const running = jobState === "run";
-  const paused = jobState === "pause";
+  const pausedLive = jobState === "pause";
+  // An auto-pause (the consecutive-failure circuit breaker) or a restart
+  // that resumed a campaign's worker but hasn't re-paused it in-memory yet
+  // both END the worker thread rather than leaving it alive-and-blocked
+  // the way a manual pause does — so jobState alone would read as "idle"
+  // even though the campaign is really sitting paused, and the button row
+  // would misleadingly offer "Start dispatch" instead of "Resume". Treat
+  // the persisted campaign status as the source of truth for "paused"
+  // whenever nothing is actually running right now.
+  const paused = pausedLive || (!running && campaignStatus === "paused");
   const idle = !running && !paused;
   const hasRemaining = (counts.pending || 0) + (counts.queued || 0) + (counts.failed || 0) > 0;
 
@@ -443,8 +459,8 @@ function renderCampaignBody(counts, recipients, jobState) {
 async function refreshCampaignView() {
   if (!state.currentCampaignId) return;
   const r = await api(`/api/campaigns/${state.currentCampaignId}/status`);
-  $("#dCampaignMeta").textContent = `${r.recipients.length} recipient(s)`;
-  renderCampaignBody(r.counts, r.recipients, r.job_state);
+  $("#dCampaignMeta").textContent = `${r.recipients.length} recipient(s) · status: ${r.status}`;
+  renderCampaignBody(r.counts, r.recipients, r.job_state, r.status, r.last_error);
 }
 
 function startPolling() {
