@@ -49,8 +49,13 @@
               <span class="radio-sub">This Pi's attached MU509, via the modem-manager daemon. See the Modem tab for live status.</span>
             </label>
           </div>
+          <div class="field" style="margin-bottom:14px;">
+            <label>Default country code</label>
+            <input type="text" id="s_cc" placeholder="e.g. 254">
+            <span class="hint">Used to expand local-format numbers like 07... that don't start with +. Applies to every recipient list regardless of which backend above is selected. Leave blank to send numbers exactly as typed (0712... local numbers still work, they're just dialed as-is rather than converted to +254712...).</span>
+          </div>
           <div class="btn-row">
-            <button class="btn btn-primary" id="btnSaveBackend">Save backend</button>
+            <button class="btn btn-primary" id="btnSaveBackend">Save</button>
           </div>
           <div class="status-msg" id="backendMsg"></div>
         </div>
@@ -74,11 +79,6 @@
             <div class="field">
               <label>Password</label>
               <input type="password" id="s_password" placeholder="(unchanged)">
-            </div>
-            <div class="field">
-              <label>Default country code</label>
-              <input type="text" id="s_cc" placeholder="e.g. 254">
-              <span class="hint">Used to expand local-format numbers like 07... that don't start with +</span>
             </div>
             <div class="field">
               <label>SIM slot (optional)</label>

@@ -53,8 +53,12 @@ Data is stored in `data/dashboard.db` (SQLite) — safe to delete to reset every
   are auto-detected; you can also pick manually).
 - Any other column can be referenced in your template as `{column_name}`.
 - Numbers without a `+` country code are expanded using the **Default country
-  code** you set in Settings (e.g. `254` turns `0712345678` into
-  `+254712345678`). Set this before uploading real recipient lists.
+  code** field in Settings → SMS dispatch backend (e.g. `254` turns
+  `0712345678` into `+254712345678`) — it applies to every recipient list
+  regardless of which backend you're dispatching through. Leave it blank and
+  local-format numbers (`0712345678`) are still sent correctly, just as
+  typed rather than converted to `+254712345678` — what you should **never**
+  see is a broken `+0712345678`; if that ever shows up, something's wrong.
 - Grab **Download a sample CSV** from the Compose tab for the expected shape.
 
 ## Deploying on a Raspberry Pi

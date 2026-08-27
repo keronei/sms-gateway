@@ -92,6 +92,18 @@ def normalize_phone(raw: str, default_country_code: str = ""):
             # strip a leading 0 (common local-format convention) before prepending country code
             local = digits.lstrip("0")
             digits = f"+{cc}{local}"
+        elif digits.startswith("0"):
+            # Local-format number (e.g. 0712345678) and no country code is
+            # configured - we can't correctly expand this to E.164, and
+            # blindly prepending "+" would turn a valid local number into
+            # garbage like "+0712345678" (there's no country whose code is
+            # "0"). Leave it in local format instead - both the Android
+            # Gateway and the modem's own PDU encoding already handle a
+            # bare local number correctly (it's dialed the same way a
+            # phone on that network would dial it directly), it's only the
+            # "+" prefix that actively breaks it. Set a default country
+            # code in Settings to get proper E.164 conversion instead.
+            pass
         else:
             digits = "+" + digits
 

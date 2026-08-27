@@ -135,8 +135,14 @@ function gatherConnFields() {
 
 $("#btnSaveBackend").addEventListener("click", async () => {
   try {
-    await api("/api/settings", { method: "POST", body: JSON.stringify({ sms_backend: selectedBackend() }) });
-    showMsg($("#backendMsg"), true, `Now dispatching via ${selectedBackend() === "modem" ? "the Huawei modem" : "Android Gateway"}.`);
+    await api("/api/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        sms_backend: selectedBackend(),
+        default_country_code: $("#s_cc").value.trim(),
+      }),
+    });
+    showMsg($("#backendMsg"), true, `Saved. Dispatching via ${selectedBackend() === "modem" ? "the Huawei modem" : "Android Gateway"}.`);
     testConnection(true);
   } catch (e) { showMsg($("#backendMsg"), false, e.message); }
 });
