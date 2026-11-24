@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dispatch — SMS Mail Merge Console</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/contrib.css') }}">
 </head>
 <body>
 <div class="app-shell">
@@ -26,6 +27,7 @@
     <button class="tab-btn" data-tab="dispatch">Review &amp; Dispatch</button>
     <button class="tab-btn" data-tab="history">History</button>
     <button class="tab-btn" data-tab="modem">Modem</button>
+    <button class="tab-btn" data-tab="contrib">Contributions</button>
   </div>
 
   <!-- ============================================================ SETTINGS -->
@@ -400,7 +402,10 @@
   </section>
 
 
+  {% include '_contrib_tab.html' %}
+
 </div>
 <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/contrib.js') }}"></script>
 </body>
 </html>

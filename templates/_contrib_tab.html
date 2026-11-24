@@ -1,0 +1,235 @@
+  <!-- ======================================================== CONTRIBUTIONS -->
+  <section class="tab-panel" id="tab-contrib">
+
+    <div class="card" id="cbPinGate" style="display:none;">
+      <h2>PIN required</h2>
+      <p class="card-sub">This section is protected. Enter the PIN to continue.</p>
+      <div class="grid-3">
+        <div class="field"><label>PIN</label><input type="password" id="cbPinInput" autocomplete="off"></div>
+      </div>
+      <div class="btn-row"><button class="btn btn-primary" id="cbPinLogin">Unlock</button></div>
+      <div class="status-msg" id="cbPinMsg"></div>
+    </div>
+
+    <div id="cbMain">
+      <div class="card">
+        <div class="cb-head">
+          <div>
+            <h2>Contributions</h2>
+            <p class="card-sub" style="margin:0;">Aggregates forwarded paybill confirmation SMS by region and account. Switch it off when collection ends and the rest of the server carries on as normal.</p>
+          </div>
+          <label class="cb-switch"><input type="checkbox" id="cbEnabled"><span id="cbEnabledLabel">OFF</span></label>
+        </div>
+        <div class="chip-row" id="cbChips" style="margin-top:12px;"></div>
+        <div class="status-msg" id="cbMsg"></div>
+        <div id="cbSkipped" class="cb-note" style="display:none;"></div>
+      </div>
+
+      <div class="cb-nav" id="cbNav">
+        <button class="btn active" data-csub="overview">Overview</button>
+        <button class="btn" data-csub="attention">Needs attention <span class="cb-count" id="cbAttnCount"></span></button>
+        <button class="btn" data-csub="senders">Senders</button>
+        <button class="btn" data-csub="setup">Setup</button>
+        <button class="btn" data-csub="replies">Replies &amp; parsing</button>
+        <button class="btn" data-csub="sync">Google Sheet</button>
+        <button class="btn" data-csub="security">Security</button>
+      </div>
+
+      <!-- ---------------------------------------------------------- overview -->
+      <div class="cb-sub active" data-csub-panel="overview">
+        <div class="card">
+          <div class="cb-filters">
+            <div class="field"><label>Period</label>
+              <select id="cbPeriod">
+                <option value="today">Today</option><option value="yesterday">Yesterday</option>
+                <option value="week">This week</option><option value="month" selected>This month</option>
+                <option value="all">All time</option><option value="custom">Custom range</option>
+              </select></div>
+            <div class="field cb-custom" style="display:none;"><label>From</label><input type="date" id="cbStart"></div>
+            <div class="field cb-custom" style="display:none;"><label>To</label><input type="date" id="cbEnd"></div>
+            <div class="field"><label>Region</label><select id="cbRegion"></select></div>
+            <div class="field"><label>Account</label><select id="cbAccount"></select></div>
+            <div class="field cb-filter-actions">
+              <button class="btn btn-primary" id="cbApply">Apply</button>
+              <a class="btn" id="cbExport" href="#">Export CSV</a>
+            </div>
+          </div>
+        </div>
+        <div class="summary-row" id="cbTiles"></div>
+        <div class="card">
+          <h2>Progress by region and account</h2>
+          <p class="card-sub">“Collected” follows the period above. “Target” is the region’s own target (optional) and uses that target’s own dates.</p>
+          <div class="table-scroll" style="max-height:420px;"><table>
+            <thead><tr><th>Region</th><th>Account</th><th style="text-align:right;">Collected</th><th style="text-align:right;">Payments</th><th style="text-align:right;">People</th><th style="min-width:170px;">Target progress</th></tr></thead>
+            <tbody id="cbProgressBody"></tbody></table></div>
+        </div>
+        <div class="two-col">
+          <div class="card"><h2>By day</h2>
+            <div class="table-scroll" style="max-height:300px;"><table>
+              <thead><tr><th>Date</th><th style="text-align:right;">Collected</th><th style="text-align:right;">Payments</th></tr></thead>
+              <tbody id="cbDailyBody"></tbody></table></div></div>
+          <div class="card"><h2>Recent payments</h2>
+            <div class="table-scroll" style="max-height:300px;"><table>
+              <thead><tr><th>Paid</th><th>Phone</th><th>Region</th><th style="text-align:right;">Amount</th><th></th></tr></thead>
+              <tbody id="cbRowsBody"></tbody></table></div>
+            <div class="btn-row" style="margin-top:10px;"><button class="btn" id="cbMore" style="display:none;">Load more</button></div></div>
+        </div>
+      </div>
+
+      <!-- ------------------------------------------------------- attention -->
+      <div class="cb-sub" data-csub-panel="attention">
+        <div class="card"><h2>Senders without a region</h2>
+          <p class="card-sub">Their payments are already counted under “Unassigned”. Pick a region and they move across, including past payments.</p>
+          <div class="table-scroll" style="max-height:320px;"><table>
+            <thead><tr><th>Phone</th><th style="text-align:right;">Paid</th><th>Payments</th><th>Assign region</th></tr></thead>
+            <tbody id="cbUnassignedBody"></tbody></table></div></div>
+        <div class="card"><h2>Messages to review</h2>
+          <p class="card-sub">Rejected, unreadable or unrecognised payment messages. After fixing the cause (e.g. adding a paybill), re-read the failed ones.</p>
+          <div class="btn-row" style="margin-bottom:10px;"><button class="btn" id="cbReprocess">Re-read failed messages</button></div>
+          <div class="table-scroll" style="max-height:320px;"><table>
+            <thead><tr><th style="width:130px;">From</th><th style="width:120px;">Result</th><th>Detail</th><th style="width:70px;"></th></tr></thead>
+            <tbody id="cbMessagesBody"></tbody></table></div></div>
+        <div class="card"><h2>New account numbers</h2>
+          <p class="card-sub">Seen in a payment but not set up yet. Give each a project name.</p>
+          <div class="table-scroll" style="max-height:240px;"><table>
+            <thead><tr><th>Account no.</th><th>Project name</th><th style="width:90px;"></th></tr></thead>
+            <tbody id="cbNewAccountsBody"></tbody></table></div></div>
+      </div>
+
+      <!-- --------------------------------------------------------- senders -->
+      <div class="cb-sub" data-csub-panel="senders">
+        <div class="card"><h2>Find a sender</h2>
+          <p class="card-sub">Search by phone number (any format: 0712…, +254712…, or just the last digits).</p>
+          <div class="grid-3"><div class="field"><label>Phone</label><input type="text" id="cbSenderQ" placeholder="0712 345 678"></div></div>
+          <div class="table-scroll" style="max-height:480px;"><table>
+            <thead><tr><th>Phone</th><th>Name</th><th>Region</th><th style="text-align:right;">Paid</th><th>Set region</th><th></th></tr></thead>
+            <tbody id="cbSendersBody"></tbody></table></div>
+          <div class="checkbox-row" style="margin-top:12px;"><input type="checkbox" id="cbNotify"><label for="cbNotify">Also text the sender to confirm their region</label></div>
+        </div>
+      </div>
+
+      <!-- ----------------------------------------------------------- setup -->
+      <div class="cb-sub" data-csub-panel="setup">
+        <div class="card"><h2>Regions</h2>
+          <p class="card-sub">A region can sit under another (wards under a constituency). Senders reply with the <b>code</b>, or the name.</p>
+          <div class="grid-3">
+            <div class="field"><label>Name</label><input type="text" id="cbRName" placeholder="Karen"></div>
+            <div class="field"><label>Code</label><input type="text" id="cbRCode" placeholder="KAR"></div>
+            <div class="field"><label>Parent (optional)</label><select id="cbRParent"></select></div>
+            <div class="field"><label>Type</label><input type="text" id="cbRKind" value="ward"></div>
+            <div class="field"><label>Other spellings (comma separated)</label><input type="text" id="cbRAliases" placeholder="Karen ward, Karen B"></div>
+          </div>
+          <div class="btn-row"><button class="btn btn-primary" id="cbAddRegion">Add region</button>
+            <button class="btn" id="cbToggleBulk">Add many at once</button></div>
+          <div id="cbBulk" style="display:none; margin-top:12px;">
+            <div class="field"><label>One per line: Name, CODE  or  Name, CODE, PARENT_CODE</label>
+              <textarea id="cbBulkText" rows="6" placeholder="Langata, LAN&#10;Karen, KAR, LAN&#10;South C, SC, LAN"></textarea></div>
+            <button class="btn" id="cbBulkGo">Import</button>
+          </div>
+          <div class="status-msg" id="cbRegionMsg"></div>
+          <div class="table-scroll" style="max-height:380px; margin-top:12px;"><table>
+            <thead><tr><th>Name</th><th>Code</th><th>Parent</th><th>Spellings</th><th style="width:150px;"></th></tr></thead>
+            <tbody id="cbRegionsBody"></tbody></table></div>
+        </div>
+        <div class="card"><h2>Paybills and accounts</h2>
+          <p class="card-sub">Only payments to a listed paybill are accepted. Use the account number exactly as it appears in the SMS, masked part included (e.g. <span class="mono">133***6248</span>).</p>
+          <div class="grid-3">
+            <div class="field"><label>Account number</label><input type="text" id="cbAcRef" placeholder="133***6248"></div>
+            <div class="field"><label>Project name</label><input type="text" id="cbAcLabel" placeholder="Building fund"></div>
+            <div class="field"><label>Paybill</label><select id="cbAcPaybill"></select></div>
+          </div>
+          <div class="btn-row"><button class="btn btn-primary" id="cbAddAccount">Add account</button></div>
+          <div class="status-msg" id="cbAccountMsg"></div>
+          <div class="table-scroll" style="max-height:260px; margin-top:12px;"><table>
+            <thead><tr><th>Project</th><th>Account no.</th><th>Paybill</th><th>Active</th><th style="width:150px;"></th></tr></thead>
+            <tbody id="cbAccountsBody"></tbody></table></div>
+          <div class="grid-3" style="margin-top:16px;">
+            <div class="field"><label>Add paybill number</label><input type="text" id="cbPbNumber" placeholder="522522"></div>
+            <div class="field"><label>Name</label><input type="text" id="cbPbName" placeholder="KCB Pay Bill"></div>
+          </div>
+          <div class="btn-row"><button class="btn" id="cbAddPaybill">Add paybill</button></div>
+          <div class="chip-row" id="cbPaybillChips" style="margin-top:10px;"></div>
+        </div>
+        <div class="card"><h2>Targets <span class="card-sub" style="display:inline;">(optional)</span></h2>
+          <p class="card-sub">A target for a region and account, with optional dates. Leave dates empty for an open-ended target.</p>
+          <div class="grid-3">
+            <div class="field"><label>Region</label><select id="cbTRegion"></select></div>
+            <div class="field"><label>Account</label><select id="cbTAccount"></select></div>
+            <div class="field"><label>Amount (Ksh)</label><input type="text" id="cbTAmount" placeholder="20000"></div>
+            <div class="field"><label>From (optional)</label><input type="date" id="cbTStart"></div>
+            <div class="field"><label>To (optional)</label><input type="date" id="cbTEnd"></div>
+          </div>
+          <div class="btn-row"><button class="btn btn-primary" id="cbAddTarget">Add target</button></div>
+          <div class="status-msg" id="cbTargetMsg"></div>
+          <div class="table-scroll" style="max-height:260px; margin-top:12px;"><table>
+            <thead><tr><th>Region</th><th>Account</th><th style="text-align:right;">Target</th><th>Period</th><th style="width:70px;"></th></tr></thead>
+            <tbody id="cbTargetsBody"></tbody></table></div>
+        </div>
+      </div>
+
+      <!-- --------------------------------------------------------- replies -->
+      <div class="cb-sub" data-csub-panel="replies">
+        <div class="card"><h2>Automatic replies</h2>
+          <p class="card-sub">Placeholders: <span class="mono">{amount} {region} {region_total} {target} {percent} {account} {code} {count} {sender_name} {example_code} {suggestions}</span>. Leave a message empty to send nothing for that case.</p>
+          <div class="checkbox-row" style="margin-bottom:14px;"><input type="checkbox" id="cbRepliesOn"><label for="cbRepliesOn">Send replies</label></div>
+          <div class="grid-3">
+            <div class="field"><label>Max replies per person per hour</label><input type="number" id="cbRepMax" min="0"></div>
+            <div class="field"><label>Give up on an unsent reply after (min)</label><input type="number" id="cbRepExpire" min="1"></div>
+            <div class="field"><label>Ask for a ward at most (times)</label><input type="number" id="cbPromptMax" min="0"></div>
+          </div>
+          <div id="cbTemplates"></div>
+          <div class="btn-row"><button class="btn btn-primary" id="cbSaveReplies">Save replies</button></div>
+          <div class="status-msg" id="cbRepliesMsg"></div>
+        </div>
+        <div class="card"><h2>Reading the SMS</h2>
+          <p class="card-sub">The pattern that extracts the fields from a forwarded confirmation. Only change it if the wording of the SMS changes. Required groups: <span class="mono">amount code account date time</span>; optional: <span class="mono">paybill account_name</span>.</p>
+          <div class="field"><label>Pattern</label><textarea id="cbPattern" rows="5" class="mono"></textarea></div>
+          <div class="field"><label>Try it on a message</label><textarea id="cbTestBody" rows="3" placeholder="Paste a forwarded confirmation here"></textarea></div>
+          <div class="grid-3">
+            <div class="field"><label>Ward-reply keywords</label><input type="text" id="cbKeywords"><div class="hint">A registered sender must start with one of these to change ward, e.g. “ward KAR”.</div></div>
+            <div class="field"><label>Reject payments older than (days)</label><input type="number" id="cbMaxAge" min="0"></div>
+            <div class="field"><label>Timezone</label><input type="text" id="cbTz"></div>
+          </div>
+          <div class="btn-row"><button class="btn" id="cbTestParse">Test</button>
+            <button class="btn btn-primary" id="cbSavePattern">Save</button>
+            <button class="btn" id="cbResetPattern">Restore default pattern</button></div>
+          <div class="status-msg" id="cbParseMsg"></div>
+          <pre id="cbParseOut" class="mono cb-pre" style="display:none;"></pre>
+        </div>
+      </div>
+
+      <!-- ------------------------------------------------------------ sync -->
+      <div class="cb-sub" data-csub-panel="sync">
+        <div class="card"><h2>Google Sheet sync</h2>
+          <p class="card-sub">Pushes every payment and a per-region/account summary to a spreadsheet. It only goes online when something has changed, uses Ethernet if present, and otherwise opens the modem’s internet for the sync and closes it again.</p>
+          <div id="cbSyncStatus" class="chip-row" style="margin-bottom:14px;"></div>
+          <div class="checkbox-row" style="margin-bottom:14px;"><input type="checkbox" id="cbSheetsOn"><label for="cbSheetsOn">Sync automatically</label></div>
+          <div class="grid-3">
+            <div class="field"><label>Spreadsheet ID or URL</label><input type="text" id="cbSheetId"></div>
+            <div class="field"><label>Sync at most every (min)</label><input type="number" id="cbSheetEvery" min="1"></div>
+            <div class="field"><label>Payments tab / Summary tab</label>
+              <div style="display:flex; gap:6px;"><input type="text" id="cbTabC"><input type="text" id="cbTabS"></div></div>
+          </div>
+          <div class="field"><label>Service account key (JSON)</label>
+            <textarea id="cbSaJson" rows="4" class="mono" placeholder="(stored — paste a new key to replace it)"></textarea>
+            <div class="hint" id="cbSaHint"></div></div>
+          <div class="checkbox-row" style="margin-bottom:8px;"><input type="checkbox" id="cbUseModem"><label for="cbUseModem">Use the modem’s internet when nothing else is online</label></div>
+          <div class="checkbox-row" style="margin-bottom:14px;"><input type="checkbox" id="cbMask"><label for="cbMask">Hide the middle digits of phone numbers in the sheet</label></div>
+          <div class="btn-row"><button class="btn btn-primary" id="cbSaveSheets">Save</button>
+            <button class="btn" id="cbTestSheets">Test connection</button>
+            <button class="btn" id="cbRunSync">Sync now</button></div>
+          <div class="status-msg" id="cbSheetsMsg"></div>
+        </div>
+      </div>
+
+      <!-- -------------------------------------------------------- security -->
+      <div class="cb-sub" data-csub-panel="security">
+        <div class="card"><h2>PIN</h2>
+          <p class="card-sub">Optionally lock this whole section with a PIN. It protects the contributions data inside this dashboard; it does not replace keeping the dashboard on a trusted network.</p>
+          <div class="grid-3"><div class="field"><label>New PIN (leave empty to remove)</label><input type="password" id="cbNewPin" autocomplete="new-password"></div></div>
+          <div class="btn-row"><button class="btn btn-primary" id="cbSetPin">Save PIN</button><button class="btn" id="cbLogout">Lock now</button></div>
+          <div class="status-msg" id="cbPinSetMsg"></div>
+        </div>
+      </div>
+    </div>
+  </section>

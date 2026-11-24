@@ -1,0 +1,31 @@
+/* Contributions tab - builds on the theme variables/components in style.css */
+.cb-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.cb-switch { display: flex; align-items: center; gap: 10px; cursor: pointer; font-family: var(--font-display); font-weight: 700; }
+.cb-switch input { width: 20px; height: 20px; accent-color: var(--green); cursor: pointer; }
+.cb-switch.on span { color: var(--green); }
+.cb-switch span { color: var(--muted); min-width: 28px; }
+.cb-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }
+.cb-nav .btn.active { border-color: var(--amber); color: var(--amber); }
+.cb-count { background: var(--red); color: #12141a; border-radius: 999px; font-size: 11px; font-weight: 700; padding: 1px 7px; margin-left: 4px; }
+.cb-count:empty { display: none; }
+.cb-sub { display: none; }
+.cb-sub.active { display: block; }
+.cb-filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+.cb-filters .field { margin-bottom: 0; min-width: 150px; }
+.cb-filter-actions { display: flex; flex-direction: row; gap: 8px; align-items: center; }
+.cb-filter-actions .btn { white-space: nowrap; text-decoration: none; }
+.cb-note { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--amber-dim); border-radius: 8px; background: rgba(242,184,75,0.08); font-size: 13px; }
+.cb-note .btn { margin-left: 8px; }
+.cb-pre { white-space: pre-wrap; background: var(--panel-alt); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 10px; font-size: 12px; }
+.cb-tpl { margin-bottom: 14px; }
+.cb-tpl textarea { min-height: 62px; }
+.cb-tpl .cb-prev { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.cb-tpl .cb-prev b { color: var(--text); font-weight: 500; }
+.cb-target-bar { height: 6px; border-radius: 999px; background: var(--panel-alt); border: 1px solid var(--border); overflow: hidden; margin: 4px 0 0; }
+.cb-target-bar > div { height: 100%; background: var(--green); }
+.cb-target-bar > div.over { background: var(--amber); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.cb-inline { display: flex; gap: 6px; align-items: center; }
+.cb-inline select, .cb-inline input { min-width: 120px; }
+.cb-void { text-decoration: line-through; opacity: .55; }
+@media (max-width: 720px) { .cb-filters .field { min-width: 100%; } }
