@@ -1,2 +1,5 @@
 Flask>=3.0
 requests>=2.31
+# Contributions feature: signs the Google service-account login for the Sheets sync
+# (cryptography is pulled in by the [crypto] extra; no google-* libraries needed)
+PyJWT[crypto]>=2.6

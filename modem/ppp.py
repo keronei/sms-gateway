@@ -64,6 +64,14 @@ class PPPSupervisor:
         self._reconnect_now = threading.Event()
         self._authorized = False  # only True after an explicit request_reconnect() -
                                    # see _supervise_loop()'s top-of-loop check and comments
+        # A temporary "session" (request_session()/end_session()), used by
+        # the contributions Google-Sheets sync to get online just long
+        # enough to push data. It opens the dial gate WITHOUT needing the
+        # persisted modem_auto_connect setting, and - unlike
+        # request_reconnect() - it can be closed again on purpose.
+        self._session_override = False
+        self._session_ended = False   # set by end_session(); consumed by _supervise_loop()
+        self._connected = False
         self._thread = None
         self._proc = None
         self._backoff = ExponentialBackoff(base=5, factor=2, max_delay=300)
@@ -95,15 +103,53 @@ class PPPSupervisor:
         after settings changed - always begins "disconnected until asked",
         even if modem_auto_connect was left on 1 from a previous run."""
         self._authorized = True
+        # an explicit user request always wins over a sync-only session:
+        # from here on the link belongs to the user, so a later
+        # end_session() from the sync job must NOT tear it down.
+        self._session_override = False
+        self._session_ended = False
         self._backoff.reset()
         self._kill_pppd()
         self._reconnect_now.set()
+
+    def request_session(self):
+        """Open the dial gate for ONE temporary session (see
+        _session_override above). Never persists anything and never
+        overrides a connection the user already asked for. Returns:
+          "started"            - we opened the gate; caller should
+                                 end_session() when finished
+          "already_connected"  - a link is already up (user-requested);
+                                 use it, and do NOT end_session() it
+          "already_requested"  - the user's own request is mid-dial/backoff;
+                                 leave it alone
+        """
+        if self._authorized:
+            return "already_connected" if self._connected else "already_requested"
+        self._session_override = True
+        self._session_ended = False
+        self._authorized = True
+        self._backoff.reset()
+        self._reconnect_now.set()
+        return "started"
+
+    def end_session(self):
+        """Close a session opened by request_session(). A no-op (returns
+        False) unless this supervisor's link is currently a sync-only
+        session - i.e. never disconnects something the user requested."""
+        if not self._session_override:
+            return False
+        self._session_override = False
+        self._authorized = False
+        self._session_ended = True
+        self._reconnect_now.set()   # wake _monitor_until_dropped()/_wait() promptly
+        self._kill_pppd()
+        return True
 
     # ------------------------------------------------------------- loop
     def _supervise_loop(self):
         self._log("info", "PPP supervisor starting")
         while not self._stop.is_set():
-            if not self._authorized or not self.auto_connect():
+            if not self._authorized or not (self.auto_connect() or self._session_override):
                 db.update_modem_status(ppp_state="down")
                 self._wait(5)
                 continue
@@ -118,6 +164,7 @@ class PPPSupervisor:
                     ppp_state="connected", ppp_ip=ip, ppp_last_error=None,
                     ppp_retry_count=0, ppp_connected_since=time.time(), ppp_next_retry_at=None,
                 )
+                self._connected = True
                 self._log("info", f"Connected, IP={ip}")
                 # consume whatever request led to THIS dial attempt now,
                 # before monitoring begins - otherwise a leftover
@@ -128,8 +175,18 @@ class PPPSupervisor:
                 # test_ppp_supervisor.py for the regression this guards).
                 self._reconnect_now.clear()
                 self._monitor_until_dropped()
+                self._connected = False
                 if self._stop.is_set():
                     break
+                if self._session_ended:
+                    # a sync session was closed on purpose (end_session()):
+                    # not a drop, not a reconnect request - just go back to
+                    # "disconnected until asked".
+                    self._session_ended = False
+                    self._reconnect_now.clear()
+                    db.update_modem_status(ppp_state="down", ppp_ip=None)
+                    self._log("info", "Sync session ended - PPP disconnected")
+                    continue
                 # _reconnect_now still being set (nothing clears it between
                 # _monitor_until_dropped() returning and here - only _wait()
                 # does that) tells us WHY monitoring stopped: a deliberate

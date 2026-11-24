@@ -22,6 +22,8 @@ or a directly-attached Huawei modem — see "SMS dispatch backend" below.
 4. **History** — every campaign and its per-recipient outcome is saved locally
    (SQLite) so you can revisit it or export a results CSV.
 
+> **Also included:** an optional [Contributions](#contributions--forwarded-paybill-payments) feature that aggregates forwarded M-PESA/KCB paybill confirmations by region and account, replies to contributors, and syncs to a Google Sheet. It is off until you switch it on.
+
 ## Requirements
 
 - Python 3.9+
@@ -480,3 +482,77 @@ deadlock), so not worth more machinery for now.
 - Don't expose port 5050 directly to the internet without adding
   authentication in front of it (e.g. a reverse proxy with basic auth, or keep
   it Tailscale-only).
+
+## Contributions — forwarded paybill payments
+
+An optional, switchable feature that reuses the SMS infrastructure above for a different job: people pay to a paybill, **forward the confirmation SMS** to the number on this device, and the server aggregates the payments so you can watch progress per region and per account.
+
+It is isolated from the rest of the app: its own tables, its own settings, one master switch. Switched **off**, nothing reads the inbox, replies or syncs, and the dispatcher/modem behave exactly as before.
+
+### What happens to a forwarded message
+
+For a confirmation like
+
+```
+Ksh 200.00 sent to KCB Pay Bill 522522 for account 133***6248 MINISTRY OF REPENTANCE AND HOLINESS
+has been received on 24/05/2026 at 11:27 AM. M-PESA ref UEOQP5BEC6. To reverse this transaction, SMS this message to 16120.
+```
+
+the server extracts the **amount, paybill, (masked) account number, M-PESA reference, and the date/time of payment**, plus the **forwarding phone** (the sender). Then:
+
+1. **Duplicate guard:** the M-PESA reference is unique in the database. A reference that was already recorded is not counted again and the sender is told so (the reply never reveals who recorded it). This is enforced by the database itself, so two simultaneous forwards of one receipt still produce exactly one record.
+2. **New senders** are recorded immediately (counted as "Unassigned") and asked to reply with their **ward code**. When they reply, their earlier payments move to that ward. Senders who never reply can be assigned by you: Contributions → Senders, search the phone, pick a region.
+3. **Known senders** get a thank-you with their region's running total, e.g. *"Your support of Ksh 200 has been received. Your region's progress as at today is Ksh 31,000. Thank you."* If the ward has a target, the message can include it (`{target}`, `{percent}`).
+4. A registered sender can change ward by texting `ward KAR` (the keyword is required so that ordinary texts never move anyone).
+
+Several confirmations forwarded in one message are all handled. Payments to a paybill that isn't on your list are rejected and shown under **Needs attention**; account numbers not seen before are recorded and flagged until you give them a project name.
+
+### Turning it on
+
+1. Dashboard → **Contributions** → **Setup**: add your regions (*Add many at once* takes lines like `Karen, KAR, LAN` = name, code, parent code), your accounts (the account number **exactly as printed in the SMS**, masked part included, plus a project name) and, optionally, targets. The paybill `522522` is added for you; if yours is different, add it under *Paybills and accounts* (only payments to a listed paybill are accepted).
+2. Flip the switch at the top. From then on, new inbox messages are processed. Messages that were already in the inbox are *not* processed unless you press **Process them** (shown after enabling).
+3. Give out the SIM's number. Check **Replies & parsing** to adjust the reply wording (each template shows a live preview with its SMS segment count; leave one empty to send nothing for that case).
+
+Contributions needs the modem daemon (it reads `modem_inbox` and sends replies through the modem). Replies always go out through the modem, even if your campaigns use the Android gateway.
+
+### Viewing progress
+
+**Overview** has filters for today / yesterday / this week / this month / all time / a custom range, plus region (a constituency includes its wards) and account. It shows totals, a region × account progress table (with target bars where a target exists), a by-day table and the latest payments, with CSV export. Dates are the payment time **printed in the SMS**, in the configured timezone (default `Africa/Nairobi`), never when the Pi happened to process it. Targets are optional; without one you simply see the running total. A mistaken payment can be **voided** (and restored); voided payments stop counting but stay in the record.
+
+### Google Sheet sync
+
+The Pi pushes the data to a Google Sheet that you can pivot, chart or share. It uses a **service account** (no Google libraries on the Pi; only `requests` and `PyJWT`).
+
+One-time setup:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/) create a project and enable the **Google Sheets API**.
+2. *IAM & Admin → Service Accounts* → create one → *Keys → Add key → JSON*. Download the file.
+3. Create a Google Sheet and **share it with the service account's `client_email` as Editor**.
+4. Dashboard → Contributions → **Google Sheet**: paste the sheet's URL (or ID) and the JSON key, tick *Sync automatically*, Save, then **Test connection**.
+
+It writes two tabs (created if missing): **Contributions** (one row per payment, voids flagged) and **Summary** (region × account totals, targets and progress). Each sync rewrites the tabs, so voids, region assignments and renames always converge.
+
+**How it gets online.** The modem never dials by itself (see *Because the Pi is currently offline*). A sync is therefore a short *window*, and only when something has changed since the last one:
+
+- If there is already internet (Ethernet, or a modem link you opened yourself), it uses that and leaves the connection exactly as it found it.
+- Otherwise it asks the modem daemon for a **temporary session**, waits for the link, pushes, and **closes the link again**. This does *not* turn on the persistent "auto-connect" setting, and a link you requested yourself is never torn down by a sync.
+- On failure it keeps the data queued and retries after ~10 minutes (normal cadence: at most every *N* minutes, default 60). Turn off *Use the modem's internet…* to sync only when Ethernet is present.
+
+The key is stored in the app's SQLite database in plain text, so keep that file (`data/`) readable only by the service user. You can tick *Hide the middle digits of phone numbers* if the sheet will be shared widely.
+
+### Security
+
+The dashboard itself has no login, and this tab shows phone numbers and money. Under **Security** you can set an optional **PIN** that locks the whole Contributions section (stored as a salted hash; five wrong tries lock that client out for a minute). It is a convenience lock for a trusted network, not a replacement for one.
+
+### Things worth knowing
+
+- **Forwarded SMS can be forged.** Nothing here can verify a confirmation against M-PESA. The checks are: the paybill must be one you list, the reference must look right, and the payment's date must be plausible relative to when the SMS arrived. Void anything suspicious.
+- **Don't delete inbox messages before they're processed** (Modem tab → Inbox). Processing happens within seconds when the feature is on, and the Needs-attention list shows anything that couldn't be read.
+- **The Pi has no battery-backed clock.** Reports use the payment time from the SMS, so they stay right. The Sheets login uses Google's own clock to sign requests, so a drifted Pi clock doesn't break syncing. "As at today" in replies and target periods use the Pi's clock, so keep NTP working when online.
+- **Rate limits protect your SMS bundle:** at most *N* replies per person per hour (default 20), a bounded number sent to the modem at once, and a reply that can't be sent within 30 minutes (modem down, no credit) is dropped rather than delivered hours late. It never replies to short codes or sender names such as `MPESA`.
+- **If the SMS wording changes**, edit the pattern under *Replies & parsing*; the *Try it* box shows exactly what is extracted. After fixing a cause (e.g. adding a paybill), *Re-read failed messages* on the Needs-attention tab re-processes only the messages that produced no payment.
+- Single-process, like the dispatcher: run one gunicorn worker (`-w 1`). Set `CONTRIB_DISABLE_WORKER=1` to prevent the feature's background threads from starting at all.
+- The ingest pipeline takes `(source, message id, sender, text, time)`, so a WhatsApp callback can feed the same aggregation later without any change to the data model.
+
+Tests: `python3 -m unittest discover -s tests -t .` (the contributions tests are `tests/test_contrib_*.py` and `tests/test_ppp_sync_session.py`).
+

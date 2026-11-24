@@ -328,6 +328,30 @@ class ModemManager:
         self._ensure_ppp_supervisor()
         self.ppp.request_reconnect()
 
+    def _start_sync_session(self):
+        """Opens a TEMPORARY internet session for the contributions sync
+        (see contributions/sync.py). Unlike _authorize_and_reconnect_ppp()
+        this deliberately does NOT persist modem_auto_connect=1 - the
+        daemon's "never online unless asked" rule still holds for
+        everything except this one bounded, caller-closed session."""
+        self.reload_settings()
+        if self.ppp and self._ppp_config() != self._ppp_config_snapshot:
+            self.log("info", "ppp", "PPP settings changed; rebuilding supervisor before sync session")
+            self.ppp.stop()
+            self.ppp = None
+        self._ensure_ppp_supervisor()
+        outcome = self.ppp.request_session()
+        self.log("info", "ppp", f"Sync internet session requested ({outcome})")
+        return outcome
+
+    def _end_sync_session(self):
+        if not self.ppp:
+            return False
+        ended = self.ppp.end_session()
+        self.log("info", "ppp", "Sync internet session closed" if ended
+                 else "Sync session end requested but link is not sync-owned - left as is")
+        return ended
+
     def reload_settings_get(self, key, default=None):
         # cheap fresh read so toggling "auto connect" in Settings takes effect
         # without waiting for the outer loop's next full reload
@@ -699,6 +723,12 @@ class ModemManager:
                 self.log("info", "ppp", "Manual reconnect requested from dashboard")
                 self._authorize_and_reconnect_ppp()
                 db.complete_modem_command(cmd["id"], "done", "Reconnect triggered")
+            elif name == "ppp_sync_connect":
+                outcome = self._start_sync_session()
+                db.complete_modem_command(cmd["id"], "done", outcome)
+            elif name == "ppp_disconnect":
+                ended = self._end_sync_session()
+                db.complete_modem_command(cmd["id"], "done", "disconnected" if ended else "not_sync_owned")
             elif name == "send_sms":
                 self._handle_send_sms(cmd)
             elif name == "send_ussd":

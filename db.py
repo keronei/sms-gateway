@@ -218,6 +218,10 @@ def init_db():
         )
         _ensure_column(conn, "campaigns", "last_error", "TEXT")
 
+        # optional contributions feature (its own tables; see contributions/)
+        from contributions import schema as _contrib_schema
+        _contrib_schema.init(conn)
+
 
 def _ensure_column(conn, table, column, coltype):
     """Lightweight migration for a column added after CREATE TABLE IF NOT

@@ -44,6 +44,14 @@ _ensure_dirs()
 db.init_db()
 dispatcher.resume_interrupted_campaigns()
 
+# Optional contributions feature (forwarded-payment aggregation). Its
+# background threads are always started but do nothing until the feature is
+# switched on from the dashboard; set CONTRIB_DISABLE_WORKER=1 to not start
+# them at all.
+from contributions import api as contrib_api, worker as contrib_worker  # noqa: E402
+app.register_blueprint(contrib_api.bp)
+contrib_worker.start()
+
 
 # --------------------------------------------------------------------- pages
 @app.route("/")
